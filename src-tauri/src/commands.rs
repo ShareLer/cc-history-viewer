@@ -387,7 +387,12 @@ fn sanitize_for_filename(q: &str) -> String {
 #[tauri::command]
 pub fn export_conversation(
     session_id: String,
+    include_thinking: bool,
     include_tools: bool,
+    include_skills: bool,
+    include_meta: bool,
+    include_time: bool,
+    message_uuids: Vec<String>,
     write: bool,
     lang: Option<String>,
     state: State<'_, AppState>,
@@ -397,7 +402,21 @@ pub fn export_conversation(
     let detail = parser::parse_conversation_detail(Path::new(&file))
         .ok_or_else(|| "对话文件解析失败".to_string())?;
     let lang = Lang::from_opt(lang.as_deref());
-    let markdown = export::build_conversation_markdown(&detail, include_tools, lang);
+    let selected = (!message_uuids.is_empty()).then(|| {
+        message_uuids
+            .into_iter()
+            .filter(|id| !id.is_empty())
+            .collect::<std::collections::HashSet<_>>()
+    });
+    let options = export::ConversationExportOptions {
+        include_thinking,
+        include_tools,
+        include_skills,
+        include_meta,
+        include_time,
+    };
+    let (markdown, exported_count) =
+        export::build_conversation_markdown(&detail, selected.as_ref(), &options, lang);
 
     let mut path: Option<String> = None;
     if write {
@@ -412,7 +431,7 @@ pub fn export_conversation(
     Ok(ConversationExportResult {
         preview: export::truncate_preview(&markdown, lang),
         path,
-        message_count: detail.messages.len(),
+        message_count: exported_count,
     })
 }
 

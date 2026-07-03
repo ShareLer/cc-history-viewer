@@ -46,7 +46,8 @@ export type BlockKind =
   | "thinking"
   | "tool_use"
   | "tool_result"
-  | "image";
+  | "image"
+  | "skill";
 
 export interface ContentBlock {
   kind: BlockKind;
@@ -60,6 +61,9 @@ export interface ChatMessage {
   role: "user" | "assistant" | "system";
   timestamp: number;
   isSidechain: boolean;
+  isMeta: boolean;
+  metaKind: "command" | "skill" | null;
+  attributionSkill: string | null;
   blocks: ContentBlock[];
 }
 
@@ -188,6 +192,18 @@ export interface ConversationExportResult {
   preview: string;
   path: string | null;
   messageCount: number;
+}
+
+export interface ConversationExportParams {
+  sessionId: string;
+  write: boolean;
+  lang?: string;
+  includeThinking: boolean;
+  includeTools: boolean;
+  includeSkills: boolean;
+  includeMeta: boolean;
+  includeTime: boolean;
+  messageUuids: string[];
 }
 
 /* ----------------------------- 设置 ----------------------------- */

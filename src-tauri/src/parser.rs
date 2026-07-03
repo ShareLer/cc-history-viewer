@@ -128,6 +128,7 @@ struct ConvLine {
     git_branch: Option<String>,
     version: Option<String>,
     is_sidechain: Option<bool>,
+    is_meta: Option<bool>,
     #[serde(rename = "requestId")]
     request_id: Option<String>,
     /// system 行的子类型（如 "local_command"：斜杠命令的调用标记）
@@ -135,6 +136,8 @@ struct ConvLine {
     /// system 行的顶层内容（local_command 时为命令文本）
     content: Option<serde_json::Value>,
     message: Option<ConvMessage>,
+    attachment: Option<ConvAttachment>,
+    attribution_skill: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +150,23 @@ struct ConvMessage {
     model: Option<String>,
     /// assistant 行才有：token 用量
     usage: Option<RawUsage>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConvAttachment {
+    #[serde(rename = "type")]
+    attachment_type: Option<String>,
+    content: Option<serde_json::Value>,
+    #[serde(rename = "stdout")]
+    _stdout: Option<String>,
+    skills: Option<Vec<InvokedSkill>>,
+}
+
+#[derive(Deserialize)]
+struct InvokedSkill {
+    name: Option<String>,
+    content: Option<String>,
 }
 
 /// assistant 行 message.usage 的原始形状（JSON 字段即 snake_case，无需 rename）
@@ -232,6 +252,9 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
             }
         }
         if ltype != "user" || too_big {
+            continue;
+        }
+        if parsed.is_meta.unwrap_or(false) {
             continue;
         }
         if parsed.is_sidechain.unwrap_or(false) {
@@ -370,7 +393,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
     let mut ended_at = i64::MIN;
     let mut messages: Vec<ChatMessage> = Vec::new();
 
-    for line in content.lines() {
+    for (line_no, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -408,16 +431,24 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
         }
         // 斜杠命令的调用标记（system/local_command）也呈现在对话流里：
         // /btw 这类侧问命令的回答 CC 不持久化，但至少能看到「这里执行过命令」。
+        let stable_uuid = parsed
+            .uuid
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("{session_id}:{}", line_no + 1));
         if ltype == "system" {
             if parsed.subtype.as_deref() == Some("local_command") {
                 if let Some(serde_json::Value::String(c)) = &parsed.content {
                     let text = prettify_display_text(c);
                     if !text.is_empty() {
                         messages.push(ChatMessage {
-                            uuid: parsed.uuid.unwrap_or_default(),
+                            uuid: stable_uuid,
                             role: "system".to_string(),
                             timestamp: ts.unwrap_or(0),
                             is_sidechain: false,
+                            is_meta: parsed.is_meta.unwrap_or(false),
+                            meta_kind: Some("command".to_string()),
+                            attribution_skill: None,
                             blocks: vec![ContentBlock {
                                 kind: "text".to_string(),
                                 text: Some(text),
@@ -430,6 +461,23 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
             }
             continue;
         }
+        if ltype == "attachment" {
+            if let Some(blocks) = skill_attachment_blocks(parsed.attachment.as_ref()) {
+                if !blocks.is_empty() {
+                    messages.push(ChatMessage {
+                        uuid: stable_uuid,
+                        role: "system".to_string(),
+                        timestamp: ts.unwrap_or(0),
+                        is_sidechain: parsed.is_sidechain.unwrap_or(false),
+                        is_meta: parsed.is_meta.unwrap_or(false),
+                        meta_kind: Some("skill".to_string()),
+                        attribution_skill: None,
+                        blocks,
+                    });
+                }
+            }
+            continue;
+        }
         if ltype != "user" && ltype != "assistant" {
             continue;
         }
@@ -438,15 +486,29 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
             None => continue,
         };
         let role = msg.role.clone().unwrap_or_else(|| ltype.to_string());
-        let blocks = content_to_blocks(msg.content.as_ref());
+        let mut blocks = content_to_blocks(msg.content.as_ref());
+        if let Some(skill) = parsed.attribution_skill.as_deref().filter(|s| !s.is_empty()) {
+            blocks.insert(
+                0,
+                ContentBlock {
+                    kind: "skill".to_string(),
+                    text: Some(skill.to_string()),
+                    tool_name: None,
+                    tool_input: None,
+                },
+            );
+        }
         if blocks.is_empty() {
             continue;
         }
         messages.push(ChatMessage {
-            uuid: parsed.uuid.unwrap_or_default(),
+            uuid: stable_uuid,
             role,
             timestamp: ts.unwrap_or(0),
             is_sidechain: parsed.is_sidechain.unwrap_or(false),
+            is_meta: parsed.is_meta.unwrap_or(false),
+            meta_kind: None,
+            attribution_skill: parsed.attribution_skill.clone(),
             blocks,
         });
     }
@@ -467,6 +529,63 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
         version,
         messages,
     })
+}
+
+fn skill_attachment_blocks(attachment: Option<&ConvAttachment>) -> Option<Vec<ContentBlock>> {
+    let attachment = attachment?;
+    let kind = attachment.attachment_type.as_deref().unwrap_or("");
+    match kind {
+        "skill_listing" => {
+            let text = attachment_value_text(attachment.content.as_ref());
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(vec![ContentBlock {
+                kind: "skill".to_string(),
+                text: Some(truncate(text.trim())),
+                tool_name: Some("skill_listing".to_string()),
+                tool_input: None,
+            }])
+        }
+        "invoked_skills" => {
+            let mut sections = Vec::new();
+            if let Some(skills) = &attachment.skills {
+                for skill in skills {
+                    let name = skill.name.as_deref().unwrap_or("skill");
+                    let body = skill.content.as_deref().unwrap_or("").trim();
+                    sections.push(if body.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{name}\n\n{body}")
+                    });
+                }
+            }
+            let text = sections.join("\n\n---\n\n");
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(vec![ContentBlock {
+                kind: "skill".to_string(),
+                text: Some(truncate(text.trim())),
+                tool_name: Some("invoked_skills".to_string()),
+                tool_input: None,
+            }])
+        }
+        _ => None,
+    }
+}
+
+fn attachment_value_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
 }
 
 // ----------------------------- 文本处理 -----------------------------

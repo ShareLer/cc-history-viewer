@@ -2,9 +2,9 @@
 //! 不重新解析任何 JSONL —— 数据全部来自 indexer 产出的 PromptEntry / parser 产出的 ConversationDetail。
 //! 所有用户可见文案支持 zh / en（由 lang 参数控制，默认 zh）。
 
-use crate::models::{ContentBlock, ConversationDetail, PromptEntry};
+use crate::models::{ChatMessage, ContentBlock, ConversationDetail, PromptEntry};
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// 单条 prompt 正文超过此字符数仍原样保留（导出追求「完整」，不截断）。
 /// 仅用于在「预览」里限制返回给前端的长度。
@@ -370,25 +370,68 @@ pub fn build_search_export(
 
 // ----------------------------- 对话导出 -----------------------------
 
+pub struct ConversationExportOptions {
+    pub include_thinking: bool,
+    pub include_tools: bool,
+    pub include_skills: bool,
+    pub include_meta: bool,
+    pub include_time: bool,
+}
+
 /// 把单个会话的完整对话渲染为 Markdown。
-/// include_tools=false 时省略 thinking / tool_use / tool_result 块；
+/// include_thinking / include_tools / include_skills / include_meta / include_time 控制导出内容。
 /// 一条消息若没有任何可渲染的块则整条跳过。
 pub fn build_conversation_markdown(
     detail: &ConversationDetail,
-    include_tools: bool,
+    selected_message_uuids: Option<&HashSet<String>>,
+    options: &ConversationExportOptions,
     lang: Lang,
-) -> String {
+) -> (String, usize) {
     let mut md = String::new();
+    let label = |zh: &'static str, en: &'static str| match lang {
+        Lang::Zh => zh,
+        Lang::En => en,
+    };
+    let mut rendered_messages: Vec<(String, String)> = Vec::new();
+    for m in &detail.messages {
+        if let Some(selected) = selected_message_uuids {
+            if !selected.contains(&m.uuid) {
+                continue;
+            }
+        }
+        if m.is_meta && !options.include_meta {
+            continue;
+        }
+        let mut body = String::new();
+        for b in &m.blocks {
+            render_block(&mut body, b, options, lang);
+        }
+        if body.is_empty() {
+            continue; // 整条消息没有可渲染内容（如仅含工具块且未勾选包含工具）
+        }
+        let who = message_label(m, lang);
+        let side = if m.is_sidechain {
+            label("（子代理）", " (subagent)")
+        } else {
+            ""
+        };
+        let meta = if m.is_meta {
+            label("（Meta）", " (Meta)")
+        } else {
+            ""
+        };
+        rendered_messages.push((
+            format!("## {}{}{}{}\n\n", who, message_time(m, options), side, meta),
+            body,
+        ));
+    }
+    let exported_count = rendered_messages.len();
 
     // 头部
     md.push_str(match lang {
         Lang::Zh => "# 对话导出\n\n",
         Lang::En => "# Conversation Export\n\n",
     });
-    let label = |zh: &'static str, en: &'static str| match lang {
-        Lang::Zh => zh,
-        Lang::En => en,
-    };
     if !detail.project.is_empty() {
         md.push_str(&format!(
             "> **{}**　`{}`\n",
@@ -411,46 +454,22 @@ pub fn build_conversation_markdown(
     md.push_str(&format!(
         "> **{}**　{}\n",
         label("消息数", "Messages"),
-        detail.messages.len()
+        exported_count
     ));
     md.push_str(&format!(
         "> **{}**　`{}`\n\n---\n\n",
         label("会话 ID", "Session ID"),
         detail.session_id
     ));
-
-    // 正文
-    for m in &detail.messages {
-        let mut body = String::new();
-        for b in &m.blocks {
-            render_block(&mut body, b, include_tools, lang);
-        }
-        if body.is_empty() {
-            continue; // 整条消息没有可渲染内容（如仅含工具块且未勾选包含工具）
-        }
-        let who = if m.role == "user" {
-            label("🧑 用户", "🧑 User")
-        } else {
-            label("🤖 Claude", "🤖 Claude")
-        };
-        let side = if m.is_sidechain {
-            label("（子代理）", " (subagent)")
-        } else {
-            ""
-        };
-        md.push_str(&format!(
-            "## {} · {}{}\n\n",
-            who,
-            fmt_time(m.timestamp, "%Y-%m-%d %H:%M"),
-            side
-        ));
+    for (title, body) in rendered_messages {
+        md.push_str(&title);
         md.push_str(&body);
     }
-    md
+    (md, exported_count)
 }
 
 /// 渲染单个内容块；不可见（未勾选工具）时不输出任何内容。
-fn render_block(md: &mut String, b: &ContentBlock, include_tools: bool, lang: Lang) {
+fn render_block(md: &mut String, b: &ContentBlock, options: &ConversationExportOptions, lang: Lang) {
     let label = |zh: &'static str, en: &'static str| match lang {
         Lang::Zh => zh,
         Lang::En => en,
@@ -468,7 +487,7 @@ fn render_block(md: &mut String, b: &ContentBlock, include_tools: bool, lang: La
                 b.text.as_deref().unwrap_or(label("[图片]", "[image]"))
             ));
         }
-        "thinking" if include_tools => {
+        "thinking" if options.include_thinking => {
             md.push_str(&format!(
                 "**{}**\n\n",
                 label("💭 思考过程", "💭 Thinking")
@@ -482,7 +501,7 @@ fn render_block(md: &mut String, b: &ContentBlock, include_tools: bool, lang: La
                 md.push('\n');
             }
         }
-        "tool_use" if include_tools => {
+        "tool_use" if options.include_tools => {
             md.push_str(&format!(
                 "**{} · {}**\n\n",
                 label("🔧 工具调用", "🔧 Tool call"),
@@ -496,7 +515,7 @@ fn render_block(md: &mut String, b: &ContentBlock, include_tools: bool, lang: La
             // 用四个反引号围栏，避免与内容里的 ``` 冲突
             md.push_str(&format!("````json\n{input}\n````\n\n"));
         }
-        "tool_result" if include_tools => {
+        "tool_result" if options.include_tools => {
             md.push_str(&format!(
                 "**{}**\n\n",
                 label("↩ 工具结果", "↩ Tool result")
@@ -504,7 +523,48 @@ fn render_block(md: &mut String, b: &ContentBlock, include_tools: bool, lang: La
             let t = b.text.as_deref().unwrap_or("");
             md.push_str(&format!("````\n{}\n````\n\n", t.trim()));
         }
+        "skill" if options.include_skills => {
+            md.push_str(&format!("**{}**\n\n", label("🧩 Skill 详情", "🧩 Skill details")));
+            if let Some(t) = b.text.as_deref().filter(|t| !t.trim().is_empty()) {
+                md.push_str(&format!("````\n{}\n````\n\n", t.trim()));
+            }
+        }
         _ => {}
+    }
+}
+
+fn message_time(m: &ChatMessage, options: &ConversationExportOptions) -> String {
+    if options.include_time {
+        format!(" · {}", fmt_time(m.timestamp, "%Y-%m-%d %H:%M"))
+    } else {
+        String::new()
+    }
+}
+
+fn message_label(m: &ChatMessage, lang: Lang) -> &'static str {
+    match (m.role.as_str(), m.meta_kind.as_deref()) {
+        ("user", _) => match lang {
+            Lang::Zh if m.is_meta => "⚙ Meta",
+            Lang::En if m.is_meta => "⚙ Meta",
+            Lang::Zh => "🧑 用户",
+            Lang::En => "🧑 User",
+        },
+        ("system", Some("command")) => match lang {
+            Lang::Zh => "⌘ 命令",
+            Lang::En => "⌘ Command",
+        },
+        ("system", Some("skill")) => match lang {
+            Lang::Zh => "🧩 Skill",
+            Lang::En => "🧩 Skill",
+        },
+        ("system", _) => match lang {
+            Lang::Zh => "⚙ 系统",
+            Lang::En => "⚙ System",
+        },
+        _ => match lang {
+            Lang::Zh => "🤖 Claude",
+            Lang::En => "🤖 Claude",
+        },
     }
 }
 
@@ -660,6 +720,16 @@ mod tests {
         }
     }
 
+    fn conversation_options(include_tools: bool) -> ConversationExportOptions {
+        ConversationExportOptions {
+            include_thinking: include_tools,
+            include_tools,
+            include_skills: false,
+            include_meta: false,
+            include_time: false,
+        }
+    }
+
     #[test]
     fn conversation_markdown_respects_include_tools() {
         let detail = ConversationDetail {
@@ -675,6 +745,9 @@ mod tests {
                     role: "user".into(),
                     timestamp: day_start_ms("2026-05-16").unwrap(),
                     is_sidechain: false,
+                    is_meta: false,
+                    meta_kind: None,
+                    attribution_skill: None,
                     blocks: vec![text_block("帮我重构")],
                 },
                 ChatMessage {
@@ -682,6 +755,9 @@ mod tests {
                     role: "assistant".into(),
                     timestamp: day_start_ms("2026-05-16").unwrap() + 1_000,
                     is_sidechain: false,
+                    is_meta: false,
+                    meta_kind: None,
+                    attribution_skill: None,
                     blocks: vec![
                         ContentBlock {
                             kind: "thinking".into(),
@@ -702,33 +778,148 @@ mod tests {
                     role: "assistant".into(),
                     timestamp: day_start_ms("2026-05-16").unwrap() + 2_000,
                     is_sidechain: false,
+                    is_meta: false,
+                    meta_kind: None,
+                    attribution_skill: None,
                     blocks: vec![text_block("已完成")],
                 },
             ],
         };
 
         // 不含工具：纯工具消息整条消失
-        let md = build_conversation_markdown(&detail, false, Lang::Zh);
+        let (md, count) = build_conversation_markdown(
+            &detail,
+            None,
+            &conversation_options(false),
+            Lang::Zh,
+        );
         assert!(md.contains("# 对话导出"));
         assert!(md.contains("帮我重构"));
         assert!(md.contains("已完成"));
         assert!(!md.contains("思考过程"));
         assert!(!md.contains("Bash"));
+        assert!(!md.contains("🧑 用户 · 2026-05-16"));
         // 仅 2 条消息标题（工具消息被跳过）
         assert_eq!(md.matches("## ").count(), 2);
+        assert_eq!(count, 2);
 
         // 含工具：thinking 引用块 + tool_use 围栏
-        let md2 = build_conversation_markdown(&detail, true, Lang::Zh);
+        let (md2, count2) = build_conversation_markdown(
+            &detail,
+            None,
+            &conversation_options(true),
+            Lang::Zh,
+        );
         assert!(md2.contains("💭 思考过程"));
         assert!(md2.contains("> 想一想"));
         assert!(md2.contains("🔧 工具调用 · Bash"));
         assert!(md2.contains("````json"));
         assert_eq!(md2.matches("## ").count(), 3);
+        assert_eq!(count2, 3);
 
         // 英文文案
-        let md3 = build_conversation_markdown(&detail, true, Lang::En);
+        let (md3, _) = build_conversation_markdown(
+            &detail,
+            None,
+            &conversation_options(true),
+            Lang::En,
+        );
         assert!(md3.contains("# Conversation Export"));
         assert!(md3.contains("🧑 User"));
         assert!(md3.contains("💭 Thinking"));
+    }
+
+    #[test]
+    fn conversation_markdown_respects_include_meta() {
+        let detail = ConversationDetail {
+            session_id: "sess-meta".into(),
+            project: "/p/alpha".into(),
+            git_branch: None,
+            started_at: day_start_ms("2026-05-16").unwrap(),
+            ended_at: day_start_ms("2026-05-16").unwrap() + 1_000,
+            version: None,
+            messages: vec![
+                ChatMessage {
+                    uuid: "u1".into(),
+                    role: "user".into(),
+                    timestamp: day_start_ms("2026-05-16").unwrap(),
+                    is_sidechain: false,
+                    is_meta: false,
+                    meta_kind: None,
+                    attribution_skill: None,
+                    blocks: vec![text_block("真实 prompt")],
+                },
+                ChatMessage {
+                    uuid: "m1".into(),
+                    role: "user".into(),
+                    timestamp: day_start_ms("2026-05-16").unwrap() + 1_000,
+                    is_sidechain: false,
+                    is_meta: true,
+                    meta_kind: None,
+                    attribution_skill: None,
+                    blocks: vec![text_block("Base directory for this skill: /tmp/example")],
+                },
+            ],
+        };
+
+        let options = ConversationExportOptions {
+            include_thinking: false,
+            include_tools: false,
+            include_skills: false,
+            include_meta: false,
+            include_time: false,
+        };
+        let (md, count) = build_conversation_markdown(&detail, None, &options, Lang::Zh);
+        assert_eq!(count, 1);
+        assert!(md.contains("真实 prompt"));
+        assert!(!md.contains("Base directory for this skill"));
+
+        let options = ConversationExportOptions {
+            include_meta: true,
+            ..options
+        };
+        let (md, count) = build_conversation_markdown(&detail, None, &options, Lang::Zh);
+        assert_eq!(count, 2);
+        assert!(md.contains("⚙ Meta"));
+        assert!(md.contains("Base directory for this skill"));
+    }
+
+    #[test]
+    fn conversation_markdown_respects_include_time() {
+        let detail = ConversationDetail {
+            session_id: "sess-time".into(),
+            project: "/p/alpha".into(),
+            git_branch: None,
+            started_at: day_start_ms("2026-05-16").unwrap(),
+            ended_at: day_start_ms("2026-05-16").unwrap(),
+            version: None,
+            messages: vec![ChatMessage {
+                uuid: "u1".into(),
+                role: "user".into(),
+                timestamp: day_start_ms("2026-05-16").unwrap(),
+                is_sidechain: false,
+                is_meta: false,
+                meta_kind: None,
+                attribution_skill: None,
+                blocks: vec![text_block("带不带时间")],
+            }],
+        };
+        let options = ConversationExportOptions {
+            include_thinking: false,
+            include_tools: false,
+            include_skills: false,
+            include_meta: false,
+            include_time: false,
+        };
+        let (md, _) = build_conversation_markdown(&detail, None, &options, Lang::Zh);
+        assert!(md.contains("## 🧑 用户\n\n"));
+        assert!(!md.contains("## 🧑 用户 · 2026-05-16"));
+
+        let options = ConversationExportOptions {
+            include_time: true,
+            ..options
+        };
+        let (md, _) = build_conversation_markdown(&detail, None, &options, Lang::Zh);
+        assert!(md.contains("## 🧑 用户 · 2026-05-16 00:00\n\n"));
     }
 }

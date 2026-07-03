@@ -17,8 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEDUP_WINDOW_MS: i64 = 5 * 60 * 1000;
 
 /// 缓存格式版本；结构或解析规则变化时递增，旧缓存自动失效
-/// （v4：斜杠命令保留 command-args 参数）
-const CACHE_VERSION: u32 = 4;
+/// （v5：对话 prompt 索引跳过 isMeta=true 的框架注入 user 消息）
+const CACHE_VERSION: u32 = 5;
 
 /// 构建好的全量索引（仅驻留内存；磁盘缓存见 CacheV2）
 pub struct AppIndex {

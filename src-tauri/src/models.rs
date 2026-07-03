@@ -86,10 +86,15 @@ pub struct ConversationDetail {
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub uuid: String,
-    /// "user" | "assistant"
+    /// "user" | "assistant" | "system"
     pub role: String,
     pub timestamp: i64,
     pub is_sidechain: bool,
+    /// JSONL 顶层 isMeta：框架/工具注入的 user-channel 元信息，不是真实用户 prompt
+    pub is_meta: bool,
+    /// "command" | "skill" | null
+    pub meta_kind: Option<String>,
+    pub attribution_skill: Option<String>,
     pub blocks: Vec<ContentBlock>,
 }
 
@@ -97,7 +102,7 @@ pub struct ChatMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentBlock {
-    /// "text" | "thinking" | "tool_use" | "tool_result" | "image"
+    /// "text" | "thinking" | "tool_use" | "tool_result" | "image" | "skill"
     pub kind: String,
     pub text: Option<String>,
     pub tool_name: Option<String>,

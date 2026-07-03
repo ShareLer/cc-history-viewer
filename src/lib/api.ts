@@ -6,6 +6,7 @@ import { translate } from "@/i18n";
 import type {
   AppStats,
   ConversationDetail,
+  ConversationExportParams,
   ConversationExportResult,
   ExportParams,
   ExportResult,
@@ -85,15 +86,15 @@ export const api = {
       lang: p.lang,
     }),
 
-  exportConversation: (p: {
-    sessionId: string;
-    includeTools: boolean;
-    write: boolean;
-    lang?: string;
-  }) =>
+  exportConversation: (p: ConversationExportParams) =>
     invoke<ConversationExportResult>("export_conversation", {
       sessionId: p.sessionId,
+      includeThinking: p.includeThinking,
       includeTools: p.includeTools,
+      includeSkills: p.includeSkills,
+      includeMeta: p.includeMeta,
+      includeTime: p.includeTime,
+      messageUuids: p.messageUuids,
       write: p.write,
       lang: p.lang,
     }),
