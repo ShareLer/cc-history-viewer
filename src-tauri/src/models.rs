@@ -3,6 +3,62 @@
 
 use serde::{Deserialize, Serialize};
 
+/// prompt / user-channel 记录的分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptKind {
+    Human,
+    Command,
+    Meta,
+    Sidechain,
+    System,
+    Queued,
+    Sdk,
+    Other,
+}
+
+/// prompt 视图筛选开关。human 永远显示，其它类型由前端控制。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PromptVisibility {
+    pub include_commands: bool,
+    pub include_meta: bool,
+    pub include_sidechain: bool,
+    pub include_system: bool,
+    pub include_queued: bool,
+    pub include_sdk: bool,
+    pub include_other: bool,
+}
+
+impl Default for PromptVisibility {
+    fn default() -> Self {
+        Self {
+            include_commands: true,
+            include_meta: false,
+            include_sidechain: false,
+            include_system: false,
+            include_queued: false,
+            include_sdk: false,
+            include_other: false,
+        }
+    }
+}
+
+impl PromptVisibility {
+    pub fn allows(&self, kind: PromptKind) -> bool {
+        match kind {
+            PromptKind::Human => true,
+            PromptKind::Command => self.include_commands,
+            PromptKind::Meta => self.include_meta,
+            PromptKind::Sidechain => self.include_sidechain,
+            PromptKind::System => self.include_system,
+            PromptKind::Queued => self.include_queued,
+            PromptKind::Sdk => self.include_sdk,
+            PromptKind::Other => self.include_other,
+        }
+    }
+}
+
 /// 统一的 Prompt 条目（history.jsonl 与对话文件 user 消息 合并去重后的结果）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,6 +73,10 @@ pub struct PromptEntry {
     pub timestamp: i64,
     /// 来源："history" | "conversation" | "both"
     pub source: String,
+    /// 记录分类
+    pub kind: PromptKind,
+    /// 对话文件里的 user 消息 uuid；用于从 prompt 精确跳转到对话消息
+    pub message_uuid: Option<String>,
     /// 所属会话 id（可用于跳转对话详情）
     pub session_id: Option<String>,
     /// git 分支

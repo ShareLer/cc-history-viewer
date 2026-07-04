@@ -1,6 +1,25 @@
 // 与 Rust src-tauri/src/models.rs 一一对应的类型定义。
 
 export type PromptSource = "history" | "conversation" | "both";
+export type PromptKind =
+  | "human"
+  | "command"
+  | "meta"
+  | "sidechain"
+  | "system"
+  | "queued"
+  | "sdk"
+  | "other";
+
+export interface PromptVisibility {
+  includeCommands: boolean;
+  includeMeta: boolean;
+  includeSidechain: boolean;
+  includeSystem: boolean;
+  includeQueued: boolean;
+  includeSdk: boolean;
+  includeOther: boolean;
+}
 
 export interface PromptEntry {
   id: string;
@@ -8,6 +27,8 @@ export interface PromptEntry {
   project: string;
   timestamp: number;
   source: PromptSource;
+  kind: PromptKind;
+  messageUuid: string | null;
   sessionId: string | null;
   gitBranch: string | null;
   isCommand: boolean;
@@ -172,7 +193,7 @@ export interface ExportParams {
   startDate: string; // YYYY-MM-DD
   endDate: string; // YYYY-MM-DD
   project: string | null; // null = 全部文件夹
-  includeCommands: boolean;
+  visibility: PromptVisibility;
   groupBy: ExportGroupBy;
   write: boolean;
   lang?: string; // 导出文案语言："zh" | "en"，跟随界面语言

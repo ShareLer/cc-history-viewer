@@ -67,11 +67,16 @@ export const en: Record<keyof typeof zh, string> = {
   sourceHistory: "input history",
   sourceConversation: "conversation",
   sourceBoth: "history + conversation",
+  systemBadge: "system",
+  queuedBadge: "queued",
+  sdkBadge: "SDK",
+  otherBadge: "other",
   pastedCount: "{count} pasted",
   charCount: "{count} chars",
   copyPrompt: "Copy prompt",
   viewConversation: "View conversation",
   showedCount: "Showing {shown} / {total} — scroll for more",
+  otherKindsLabel: "Other types",
 
   /* ----------------------------- Home 概览 ----------------------------- */
   overviewTitle: "Overview",
@@ -142,8 +147,7 @@ export const en: Record<keyof typeof zh, string> = {
   messagesCount: "{count} messages",
   untitledSession: "(no user messages)",
   noPromptsInFolder: "No prompts in this folder",
-  noPromptsInFolderHint:
-    "If only slash commands remain, enable the “Commands” toggle in the top bar.",
+  noPromptsInFolderHint: "Adjust the filters above and try again.",
   noConversationsInFolder: "No conversations in this folder",
   noConversationsInFolderHint:
     "Sessions appear only for folders with conversation files under ~/.claude/projects.",
