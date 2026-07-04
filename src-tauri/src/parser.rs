@@ -515,22 +515,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
             None => continue,
         };
         let role = msg.role.clone().unwrap_or_else(|| ltype.to_string());
-        let mut blocks = content_to_blocks(msg.content.as_ref());
-        if let Some(skill) = parsed
-            .attribution_skill
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
-            blocks.insert(
-                0,
-                ContentBlock {
-                    kind: "skill".to_string(),
-                    text: Some(skill.to_string()),
-                    tool_name: None,
-                    tool_input: None,
-                },
-            );
-        }
+        let blocks = content_to_blocks(msg.content.as_ref());
         if blocks.is_empty() {
             continue;
         }
@@ -1197,6 +1182,37 @@ mod tests {
             classify_conversation_prompt_kind(&line, line.content.as_ref().unwrap()),
             PromptKind::Command
         );
+    }
+
+    #[test]
+    fn parse_conversation_detail_keeps_attribution_skill_as_metadata_only() {
+        let path = std::env::temp_dir().join(format!(
+            "cc_history_viewer_skill_test_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let jsonl = r#"{"type":"assistant","uuid":"a-1","timestamp":"2026-05-16T02:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"处理完成"}]},"attributionSkill":"superpowers:requesting-code-review"}"#;
+        std::fs::write(&path, jsonl).unwrap();
+
+        let detail = parse_conversation_detail(&path).expect("fixture 应能解析");
+        let msg = detail
+            .messages
+            .iter()
+            .find(|m| m.uuid == "a-1")
+            .expect("应保留原始 assistant 消息");
+        assert_eq!(
+            msg.attribution_skill.as_deref(),
+            Some("superpowers:requesting-code-review")
+        );
+        assert_eq!(
+            msg.blocks.iter().map(|b| b.kind.as_str()).collect::<Vec<_>>(),
+            vec!["text"]
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
