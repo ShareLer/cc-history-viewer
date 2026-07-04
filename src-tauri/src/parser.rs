@@ -524,23 +524,20 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
             None => continue,
         };
         let role = msg.role.clone().unwrap_or_else(|| ltype.to_string());
-        let call_id = claude_tool_call_id(msg.content.as_ref());
-        let blocks = content_to_blocks(msg.content.as_ref());
+        let blocks = content_to_parsed_blocks(msg.content.as_ref());
         if blocks.is_empty() {
             continue;
         }
-        messages.push(ChatMessage {
-            uuid: stable_uuid,
-            role,
-            phase: None,
-            call_id,
-            timestamp: ts.unwrap_or(0),
-            is_sidechain: parsed.is_sidechain.unwrap_or(false),
-            is_meta: parsed.is_meta.unwrap_or(false),
-            meta_kind: None,
-            attribution_skill: parsed.attribution_skill.clone(),
+        append_claude_messages(
+            &mut messages,
+            &stable_uuid,
+            &role,
+            ts.unwrap_or(0),
+            parsed.is_sidechain.unwrap_or(false),
+            parsed.is_meta.unwrap_or(false),
+            parsed.attribution_skill.clone(),
             blocks,
-        });
+        );
     }
 
     if started_at == i64::MAX {
@@ -585,6 +582,12 @@ struct CodexMeta {
 struct CodexUserEvent {
     timestamp: i64,
     text: String,
+}
+
+#[derive(Clone)]
+struct ParsedContentBlock {
+    block: ContentBlock,
+    call_id: Option<String>,
 }
 
 /// 解析单个 Codex session 文件，提取真实 user prompt 与会话摘要信息。
@@ -814,6 +817,11 @@ pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail
                             }],
                         });
                     }
+                } else if payload.get("type").and_then(|v| v.as_str()) == Some("web_search_end") {
+                    if let Some(msg) = codex_event_tool_result_to_message(payload, &stable_uuid, ts)
+                    {
+                        messages.push(msg);
+                    }
                 }
             }
             "response_item" => {
@@ -966,34 +974,6 @@ fn is_tool_result_message(msg: &ChatMessage) -> bool {
     msg.blocks.iter().any(|b| b.kind == "tool_result")
 }
 
-fn claude_tool_call_id(content: Option<&serde_json::Value>) -> Option<String> {
-    let arr = content?.as_array()?;
-    for block in arr {
-        match block.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-            "tool_use" => {
-                if let Some(id) = block
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    return Some(id.to_string());
-                }
-            }
-            "tool_result" => {
-                if let Some(id) = block
-                    .get("tool_use_id")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    return Some(id.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 fn message_text(msg: &ChatMessage) -> String {
     msg.blocks
         .iter()
@@ -1007,16 +987,6 @@ pub fn provider_session_id(agent: AgentKind, raw: &str) -> String {
     match agent {
         AgentKind::ClaudeCode => raw.to_string(),
         AgentKind::Codex => format!("codex:{raw}"),
-    }
-}
-
-pub fn display_session_id(agent: AgentKind, session_id: &str) -> String {
-    match agent {
-        AgentKind::ClaudeCode => session_id.to_string(),
-        AgentKind::Codex => session_id
-            .strip_prefix("codex:")
-            .unwrap_or(session_id)
-            .to_string(),
     }
 }
 
@@ -1113,6 +1083,41 @@ fn extract_codex_usage_entry(
         output,
         cache_read,
         cache_creation: 0,
+    })
+}
+
+fn codex_event_tool_result_to_message(
+    payload: &serde_json::Value,
+    stable_uuid: &str,
+    ts: Option<i64>,
+) -> Option<ChatMessage> {
+    let ptype = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let call_id = payload.get("call_id").and_then(|v| v.as_str())?;
+    let tool_name = match ptype {
+        "web_search_end" => "web_search",
+        _ => return None,
+    };
+    let text = codex_tool_output_text(payload);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(ChatMessage {
+        uuid: stable_uuid.to_string(),
+        role: "user".to_string(),
+        phase: None,
+        call_id: Some(call_id.to_string()),
+        timestamp: ts.unwrap_or(0),
+        is_sidechain: false,
+        is_meta: false,
+        meta_kind: None,
+        attribution_skill: None,
+        blocks: vec![ContentBlock {
+            kind: "tool_result".to_string(),
+            text: Some(truncate(text)),
+            tool_name: Some(tool_name.to_string()),
+            tool_input: None,
+        }],
     })
 }
 
@@ -1771,18 +1776,81 @@ fn truncate(s: &str) -> String {
     }
 }
 
-/// 把消息 content 转成内容块列表（用于对话详情展示）
-fn content_to_blocks(content: Option<&serde_json::Value>) -> Vec<ContentBlock> {
+fn append_claude_messages(
+    messages: &mut Vec<ChatMessage>,
+    stable_uuid: &str,
+    role: &str,
+    timestamp: i64,
+    is_sidechain: bool,
+    is_meta: bool,
+    attribution_skill: Option<String>,
+    parsed_blocks: Vec<ParsedContentBlock>,
+) {
+    let mut text_blocks = Vec::new();
+    let mut tool_idx = 0usize;
+    let mut text_idx = 0usize;
+
+    let mut flush_text = |messages: &mut Vec<ChatMessage>, text_blocks: &mut Vec<ContentBlock>| {
+        if text_blocks.is_empty() {
+            return;
+        }
+        let uuid = if text_idx == 0 {
+            stable_uuid.to_string()
+        } else {
+            format!("{stable_uuid}:text:{text_idx}")
+        };
+        text_idx += 1;
+        messages.push(ChatMessage {
+            uuid,
+            role: role.to_string(),
+            phase: None,
+            call_id: None,
+            timestamp,
+            is_sidechain,
+            is_meta,
+            meta_kind: None,
+            attribution_skill: attribution_skill.clone(),
+            blocks: std::mem::take(text_blocks),
+        });
+    };
+
+    for parsed in parsed_blocks {
+        if parsed.block.kind == "tool_use" || parsed.block.kind == "tool_result" {
+            flush_text(messages, &mut text_blocks);
+            tool_idx += 1;
+            messages.push(ChatMessage {
+                uuid: format!("{stable_uuid}:tool:{tool_idx}"),
+                role: role.to_string(),
+                phase: None,
+                call_id: parsed.call_id,
+                timestamp,
+                is_sidechain,
+                is_meta,
+                meta_kind: None,
+                attribution_skill: attribution_skill.clone(),
+                blocks: vec![parsed.block],
+            });
+        } else {
+            text_blocks.push(parsed.block);
+        }
+    }
+    flush_text(messages, &mut text_blocks);
+}
+
+fn content_to_parsed_blocks(content: Option<&serde_json::Value>) -> Vec<ParsedContentBlock> {
     let mut blocks = Vec::new();
     match content {
         Some(serde_json::Value::String(s)) => {
             let t = prettify_display_text(s.trim());
             if !t.is_empty() {
-                blocks.push(ContentBlock {
-                    kind: "text".to_string(),
-                    text: Some(truncate(&t)),
-                    tool_name: None,
-                    tool_input: None,
+                blocks.push(ParsedContentBlock {
+                    block: ContentBlock {
+                        kind: "text".to_string(),
+                        text: Some(truncate(&t)),
+                        tool_name: None,
+                        tool_input: None,
+                    },
+                    call_id: None,
                 });
             }
         }
@@ -1796,21 +1864,27 @@ fn content_to_blocks(content: Option<&serde_json::Value>) -> Vec<ContentBlock> {
                             if t.is_empty() {
                                 continue;
                             }
-                            blocks.push(ContentBlock {
-                                kind: "text".to_string(),
-                                text: Some(truncate(&t)),
-                                tool_name: None,
-                                tool_input: None,
+                            blocks.push(ParsedContentBlock {
+                                block: ContentBlock {
+                                    kind: "text".to_string(),
+                                    text: Some(truncate(&t)),
+                                    tool_name: None,
+                                    tool_input: None,
+                                },
+                                call_id: None,
                             });
                         }
                     }
                     "thinking" => {
                         if let Some(t) = b.get("thinking").and_then(|v| v.as_str()) {
-                            blocks.push(ContentBlock {
-                                kind: "thinking".to_string(),
-                                text: Some(truncate(t)),
-                                tool_name: None,
-                                tool_input: None,
+                            blocks.push(ParsedContentBlock {
+                                block: ContentBlock {
+                                    kind: "thinking".to_string(),
+                                    text: Some(truncate(t)),
+                                    tool_name: None,
+                                    tool_input: None,
+                                },
+                                call_id: None,
                             });
                         }
                     }
@@ -1820,28 +1894,45 @@ fn content_to_blocks(content: Option<&serde_json::Value>) -> Vec<ContentBlock> {
                             .and_then(|v| v.as_str())
                             .unwrap_or("tool")
                             .to_string();
-                        blocks.push(ContentBlock {
-                            kind: "tool_use".to_string(),
-                            text: None,
-                            tool_name: Some(name),
-                            tool_input: b.get("input").cloned(),
+                        blocks.push(ParsedContentBlock {
+                            block: ContentBlock {
+                                kind: "tool_use".to_string(),
+                                text: None,
+                                tool_name: Some(name),
+                                tool_input: b.get("input").cloned(),
+                            },
+                            call_id: b
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string),
                         });
                     }
                     "tool_result" => {
                         let txt = tool_result_text(b.get("content"));
-                        blocks.push(ContentBlock {
-                            kind: "tool_result".to_string(),
-                            text: Some(truncate(&txt)),
-                            tool_name: None,
-                            tool_input: None,
+                        blocks.push(ParsedContentBlock {
+                            block: ContentBlock {
+                                kind: "tool_result".to_string(),
+                                text: Some(truncate(&txt)),
+                                tool_name: None,
+                                tool_input: None,
+                            },
+                            call_id: b
+                                .get("tool_use_id")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string),
                         });
                     }
                     "image" => {
-                        blocks.push(ContentBlock {
-                            kind: "image".to_string(),
-                            text: Some("[图片]".to_string()),
-                            tool_name: None,
-                            tool_input: None,
+                        blocks.push(ParsedContentBlock {
+                            block: ContentBlock {
+                                kind: "image".to_string(),
+                                text: Some("[图片]".to_string()),
+                                tool_name: None,
+                                tool_input: None,
+                            },
+                            call_id: None,
                         });
                     }
                     _ => {}
@@ -2058,6 +2149,25 @@ mod tests {
                 }
             }),
             json!({
+                "timestamp": "2026-07-04T00:00:04.200Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "web_search_call",
+                    "id": "ws1",
+                    "call_id": "web1",
+                    "action": {"type": "search", "query": "Claude Code history"}
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:04.300Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "web_search_end",
+                    "call_id": "web1",
+                    "query": "Claude Code history"
+                }
+            }),
+            json!({
                 "timestamp": "2026-07-04T00:00:04.500Z",
                 "type": "response_item",
                 "payload": {
@@ -2146,7 +2256,14 @@ mod tests {
             .collect();
         assert_eq!(
             tool_call_ids,
-            vec![Some("call1"), Some("call1"), Some("call2"), Some("call2")]
+            vec![
+                Some("call1"),
+                Some("call1"),
+                Some("call2"),
+                Some("call2"),
+                Some("web1"),
+                Some("web1")
+            ]
         );
 
         let _ = std::fs::remove_file(&path);
@@ -2248,21 +2365,16 @@ mod tests {
         let jsonl = [
             json!({
                 "type": "assistant",
-                "uuid": "call-a",
+                "uuid": "assistant-tools",
                 "timestamp": "2026-07-04T00:00:00.000Z",
                 "cwd": "/tmp/project",
                 "message": {
                     "role": "assistant",
-                    "content": [{"type": "tool_use", "id": "tool-a", "name": "Bash", "input": {"command": "pwd"}}]
-                }
-            }),
-            json!({
-                "type": "assistant",
-                "uuid": "call-b",
-                "timestamp": "2026-07-04T00:00:01.000Z",
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "tool_use", "id": "tool-b", "name": "Bash", "input": {"command": "ls"}}]
+                    "content": [
+                        {"type": "text", "text": "先查目录"},
+                        {"type": "tool_use", "id": "tool-a", "name": "Bash", "input": {"command": "pwd"}},
+                        {"type": "tool_use", "id": "tool-b", "name": "Bash", "input": {"command": "ls"}}
+                    ]
                 }
             }),
             json!({
@@ -2291,6 +2403,11 @@ mod tests {
         std::fs::write(&path, jsonl).unwrap();
 
         let detail = parse_conversation_detail(&path).expect("fixture 应能解析");
+        assert!(detail.messages.iter().any(|m| m.uuid == "assistant-tools"
+            && m.call_id.is_none()
+            && m.blocks
+                .iter()
+                .any(|b| b.text.as_deref() == Some("先查目录"))));
         let tool_call_ids: Vec<Option<&str>> = detail
             .messages
             .iter()

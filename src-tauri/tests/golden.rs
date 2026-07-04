@@ -2,8 +2,8 @@
 //! Claude Code 的 JSONL 格式是本工具最大的外部依赖——格式一变（或解析逻辑被误改），
 //! 这里会第一时间报警。fixture 不含任何真实个人数据。
 
-use cc_history_viewer_lib::parser;
 use cc_history_viewer_lib::models::PromptKind;
+use cc_history_viewer_lib::parser;
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> PathBuf {
@@ -78,12 +78,19 @@ fn session_golden() {
         ]
     );
     assert_eq!(r.first_prompt, "帮我重构 parser 模块");
-    assert!(r.user_prompts.iter().all(|p| p.project == "/Users/dev/alpha"));
+    assert!(r
+        .user_prompts
+        .iter()
+        .all(|p| p.project == "/Users/dev/alpha"));
 
     // 用量提取：msg_001 被拆成两行（resume/分块复制场景）只记一次；
     // sidechain 的 assistant 行同样计入用量
     assert_eq!(r.usage_entries.len(), 3);
-    let keys: Vec<&str> = r.usage_entries.iter().map(|e| e.dedup_key.as_str()).collect();
+    let keys: Vec<&str> = r
+        .usage_entries
+        .iter()
+        .map(|e| e.dedup_key.as_str())
+        .collect();
     assert_eq!(keys, vec!["msg_001", "msg_002", "msg_003"]);
 
     let input: u64 = r.usage_entries.iter().map(|e| e.input).sum();
@@ -120,13 +127,11 @@ fn session_detail_golden() {
     // Meta 行、命令行和 sidechain 行都保留在对话流里
     assert!(d.messages[5].is_meta);
     assert_eq!(d.messages[5].role, "user");
-    assert!(
-        d.messages[5].blocks[0]
-            .text
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Base directory for this skill")
-    );
+    assert!(d.messages[5].blocks[0]
+        .text
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Base directory for this skill"));
     assert_eq!(d.messages[6].blocks[0].text.as_deref(), Some("/model"));
 
     // system/local_command 行呈现为 role="system"，命令与参数拼接展示
