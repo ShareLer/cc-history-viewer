@@ -1,6 +1,6 @@
 //! JSONL 数据解析：history.jsonl 与 projects/**/*.jsonl。
 
-use crate::models::{ChatMessage, ContentBlock, ConversationDetail, PromptKind};
+use crate::models::{ChatMessage, ContentBlock, ConversationDetail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -17,11 +17,6 @@ pub struct RawPrompt {
     pub text: String,
     pub project: String,
     pub timestamp: i64,
-    pub kind: PromptKind,
-    /// 原始记录的稳定来源键，用于区分同文本、同时间附近的真实重复 prompt。
-    pub origin_key: String,
-    /// 对话文件中的 user 消息 uuid；history.jsonl 没有该字段。
-    pub message_uuid: Option<String>,
     pub session_id: Option<String>,
     pub git_branch: Option<String>,
     pub pasted_count: usize,
@@ -78,7 +73,7 @@ pub fn parse_history(path: &Path) -> Vec<RawPrompt> {
         Err(_) => return Vec::new(),
     };
     let mut out = Vec::new();
-    for (line_no, line) in content.lines().enumerate() {
+    for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -111,9 +106,6 @@ pub fn parse_history(path: &Path) -> Vec<RawPrompt> {
             text,
             project,
             timestamp,
-            kind: classify_history_prompt_kind(&display),
-            origin_key: format!("history:{}", line_no + 1),
-            message_uuid: None,
             session_id: parsed.session_id,
             git_branch: None,
             pasted_count,
@@ -137,9 +129,6 @@ struct ConvLine {
     version: Option<String>,
     is_sidechain: Option<bool>,
     is_meta: Option<bool>,
-    origin: Option<ConvOrigin>,
-    #[serde(rename = "promptSource")]
-    prompt_source: Option<String>,
     #[serde(rename = "requestId")]
     request_id: Option<String>,
     /// system 行的子类型（如 "local_command"：斜杠命令的调用标记）
@@ -149,11 +138,6 @@ struct ConvLine {
     message: Option<ConvMessage>,
     attachment: Option<ConvAttachment>,
     attribution_skill: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ConvOrigin {
-    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -212,8 +196,7 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
     let mut started_at = i64::MAX;
     let mut ended_at = i64::MIN;
     let mut message_count = 0usize;
-    let mut first_human_prompt = String::new();
-    let mut first_any_prompt = String::new();
+    let mut first_prompt = String::new();
     let mut user_prompts: Vec<RawPrompt> = Vec::new();
     let mut usage_entries: Vec<UsageEntry> = Vec::new();
     // 文件内去重：同一 API 响应会按内容块拆成多行（message.id 相同、usage 相同），只记一次
@@ -271,6 +254,12 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
         if ltype != "user" || too_big {
             continue;
         }
+        if parsed.is_meta.unwrap_or(false) {
+            continue;
+        }
+        if parsed.is_sidechain.unwrap_or(false) {
+            continue;
+        }
         let msg = match &parsed.message {
             Some(m) => m,
             None => continue,
@@ -289,21 +278,12 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
             Some(t) => t,
             None => continue,
         };
-        let kind = classify_conversation_prompt_kind(&parsed, content_val);
         let timestamp = match ts {
             Some(t) => t,
             None => continue,
         };
-        let stable_uuid = parsed
-            .uuid
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("{session_id}:{}", line_no + 1));
-        if first_any_prompt.is_empty() {
-            first_any_prompt = prompt_text.clone();
-        }
-        if kind == PromptKind::Human && first_human_prompt.is_empty() {
-            first_human_prompt = prompt_text.clone();
+        if first_prompt.is_empty() {
+            first_prompt = prompt_text.clone();
         }
         let line_project = parsed
             .cwd
@@ -315,9 +295,6 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
             text: prompt_text,
             project: line_project,
             timestamp,
-            kind,
-            origin_key: format!("conversation:{session_id}:{stable_uuid}"),
-            message_uuid: Some(stable_uuid),
             session_id: Some(session_id.clone()),
             git_branch: parsed
                 .git_branch
@@ -344,12 +321,6 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
             }
         }
     }
-
-    let first_prompt = if !first_human_prompt.is_empty() {
-        first_human_prompt
-    } else {
-        first_any_prompt
-    };
 
     Some(ConvFileResult {
         path: path.to_path_buf(),
@@ -516,11 +487,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
         };
         let role = msg.role.clone().unwrap_or_else(|| ltype.to_string());
         let mut blocks = content_to_blocks(msg.content.as_ref());
-        if let Some(skill) = parsed
-            .attribution_skill
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(skill) = parsed.attribution_skill.as_deref().filter(|s| !s.is_empty()) {
             blocks.insert(
                 0,
                 ContentBlock {
@@ -622,131 +589,6 @@ fn attachment_value_text(value: Option<&serde_json::Value>) -> String {
 }
 
 // ----------------------------- 文本处理 -----------------------------
-
-fn classify_history_prompt_kind(display: &str) -> PromptKind {
-    if looks_like_command_text(display) {
-        PromptKind::Command
-    } else {
-        PromptKind::Human
-    }
-}
-
-fn classify_conversation_prompt_kind(
-    line: &ConvLine,
-    content: &serde_json::Value,
-) -> PromptKind {
-    if line.is_sidechain.unwrap_or(false) {
-        return PromptKind::Sidechain;
-    }
-    let origin_kind = line.origin.as_ref().and_then(|o| o.kind.as_deref());
-    let prompt_source = line.prompt_source.as_deref();
-    if line.is_meta.unwrap_or(false) {
-        return PromptKind::Meta;
-    }
-    if matches!(origin_kind, Some("task-notification"))
-        || matches!(prompt_source, Some("system"))
-    {
-        return PromptKind::System;
-    }
-    if matches!(origin_kind, Some("human")) {
-        return PromptKind::Human;
-    }
-
-    if let Some(raw) = prompt_classification_text(content) {
-        if is_meta_like_text(&raw) {
-            return PromptKind::Meta;
-        }
-        if is_command_wrapper_text(&raw) || looks_like_command_text(&raw) {
-            return PromptKind::Command;
-        }
-    }
-
-    match prompt_source {
-        Some("typed") => PromptKind::Human,
-        Some("queued") => PromptKind::Queued,
-        Some("sdk") => PromptKind::Sdk,
-        Some(_) => PromptKind::Other,
-        None => PromptKind::Human,
-    }
-}
-
-fn prompt_classification_text(content: &serde_json::Value) -> Option<String> {
-    match content {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Array(arr) => {
-            let mut parts = Vec::new();
-            for block in arr {
-                let bt = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                match bt {
-                    "text" => {
-                        if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                            parts.push(t.to_string());
-                        }
-                    }
-                    "image" => parts.push("[图片]".to_string()),
-                    _ => {}
-                }
-            }
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join("\n"))
-            }
-        }
-        _ => None,
-    }
-}
-
-fn is_meta_like_text(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    trimmed.starts_with("<local-command-stdout>")
-        || trimmed.starts_with("<local-command-stderr>")
-        || trimmed.starts_with("<local-command-caveat>")
-        || trimmed.starts_with("<system-reminder>")
-}
-
-fn is_command_wrapper_text(raw: &str) -> bool {
-    raw.contains("<command-name>")
-}
-
-fn looks_like_command_text(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    if !trimmed.starts_with('/') {
-        return false;
-    }
-    if is_path_like_slash_text(trimmed) {
-        return false;
-    }
-    let cmd = trimmed[1..]
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim();
-    !cmd.is_empty()
-        && cmd.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.' | '+')
-        })
-}
-
-fn is_path_like_slash_text(raw: &str) -> bool {
-    let first_line = raw.trim().lines().next().unwrap_or("").trim();
-    if first_line.is_empty() {
-        return false;
-    }
-    if first_line.starts_with("/Users/")
-        || first_line.starts_with("/home/")
-        || first_line.starts_with("/nfs/")
-        || first_line.starts_with("/tmp/")
-        || first_line.starts_with("/var/")
-        || first_line.starts_with("/opt/")
-        || first_line.starts_with("/private/")
-        || first_line.starts_with("/Applications/")
-    {
-        return true;
-    }
-    let token = first_line.split_whitespace().next().unwrap_or("");
-    token.len() > 1 && token[1..].contains('/')
-}
 
 /// 从 user 消息 content 提取可作为 prompt 的纯文本
 fn extract_prompt_text(content: &serde_json::Value) -> Option<String> {
@@ -914,9 +756,7 @@ fn prettify_display_text(s: &str) -> String {
             }
         }
     }
-    strip_tag_blocks(s, "local-command-caveat")
-        .trim()
-        .to_string()
+    strip_tag_blocks(s, "local-command-caveat").trim().to_string()
 }
 
 /// 字符级截断
@@ -1086,10 +926,7 @@ mod tests {
             "[Image: source: /broken"
         );
         // 普通文本不受影响
-        assert_eq!(
-            normalize_image_placeholders("hello [Image] world"),
-            "hello [Image] world"
-        );
+        assert_eq!(normalize_image_placeholders("hello [Image] world"), "hello [Image] world");
     }
 
     #[test]
@@ -1114,88 +951,6 @@ mod tests {
         assert_eq!(
             clean_prompt_text("  帮我修复这个 bug  "),
             Some("帮我修复这个 bug".to_string())
-        );
-    }
-
-    #[test]
-    fn classify_history_slash_path_as_human() {
-        assert_eq!(
-            classify_history_prompt_kind("/Users/didi/Documents/codes/project"),
-            PromptKind::Human
-        );
-        assert_eq!(classify_history_prompt_kind("/model"), PromptKind::Command);
-    }
-
-    #[test]
-    fn classify_origin_human_wins_over_command_wrapper() {
-        let content = json!("<command-name>/model</command-name>");
-        let line = ConvLine {
-            line_type: Some("user".to_string()),
-            uuid: None,
-            timestamp: None,
-            cwd: None,
-            git_branch: None,
-            version: None,
-            is_sidechain: None,
-            is_meta: None,
-            origin: Some(ConvOrigin {
-                kind: Some("human".to_string()),
-            }),
-            prompt_source: None,
-            request_id: None,
-            subtype: None,
-            content: Some(content.clone()),
-            message: Some(ConvMessage {
-                role: Some("user".to_string()),
-                content: Some(content),
-                id: None,
-                model: None,
-                usage: None,
-            }),
-            attachment: None,
-            attribution_skill: None,
-        };
-        assert_eq!(
-            classify_conversation_prompt_kind(&line, line.content.as_ref().unwrap()),
-            PromptKind::Human
-        );
-    }
-
-    #[test]
-    fn classify_array_command_wrapper_as_command() {
-        let content = json!([
-            {
-                "type": "text",
-                "text": "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>"
-            }
-        ]);
-        let line = ConvLine {
-            line_type: Some("user".to_string()),
-            uuid: None,
-            timestamp: None,
-            cwd: None,
-            git_branch: None,
-            version: None,
-            is_sidechain: None,
-            is_meta: None,
-            origin: None,
-            prompt_source: Some("typed".to_string()),
-            request_id: None,
-            subtype: None,
-            content: Some(content.clone()),
-            message: Some(ConvMessage {
-                role: Some("user".to_string()),
-                content: Some(content),
-                id: None,
-                model: None,
-                usage: None,
-            }),
-            attachment: None,
-            attribution_skill: None,
-        };
-        assert_eq!(
-            classify_conversation_prompt_kind(&line, line.content.as_ref().unwrap()),
-            PromptKind::Command
         );
     }
 

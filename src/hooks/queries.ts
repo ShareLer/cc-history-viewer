@@ -2,7 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import type { ExportGroupBy, PromptVisibility, SortMode } from "@/lib/types";
+import type { ExportGroupBy, SortMode } from "@/lib/types";
 import { useDebounce } from "./useDebounce";
 
 const FIVE_MIN = 5 * 60 * 1000;
@@ -41,10 +41,10 @@ export function useSettings(enabled = true) {
   });
 }
 
-export function useRecentPrompts(limit: number, visibility: PromptVisibility) {
+export function useRecentPrompts(limit: number, includeCommands: boolean) {
   return useQuery({
-    queryKey: ["recent-prompts", limit, visibility],
-    queryFn: () => api.getRecentPrompts(limit, visibility),
+    queryKey: ["recent-prompts", limit, includeCommands],
+    queryFn: () => api.getRecentPrompts(limit, includeCommands),
     staleTime: FIVE_MIN,
   });
 }
@@ -52,11 +52,12 @@ export function useRecentPrompts(limit: number, visibility: PromptVisibility) {
 export function useProjectPrompts(
   project: string | null,
   sort: SortMode,
-  visibility: PromptVisibility
+  includeCommands: boolean
 ) {
   return useQuery({
-    queryKey: ["project-prompts", project, sort, visibility],
-    queryFn: () => api.getProjectPrompts(project as string, sort, visibility),
+    queryKey: ["project-prompts", project, sort, includeCommands],
+    queryFn: () =>
+      api.getProjectPrompts(project as string, sort, includeCommands),
     enabled: !!project,
     staleTime: FIVE_MIN,
   });
@@ -85,21 +86,36 @@ export function useExportPreview(params: {
   startDate: string;
   endDate: string;
   project: string | null;
-  visibility: PromptVisibility;
+  includeCommands: boolean;
   groupBy: ExportGroupBy;
   lang: string;
   enabled: boolean;
 }) {
-  const { startDate, endDate, project, visibility, groupBy, lang, enabled } =
-    params;
+  const {
+    startDate,
+    endDate,
+    project,
+    includeCommands,
+    groupBy,
+    lang,
+    enabled,
+  } = params;
   return useQuery({
-    queryKey: ["export-preview", startDate, endDate, project, visibility, groupBy, lang],
+    queryKey: [
+      "export-preview",
+      startDate,
+      endDate,
+      project,
+      includeCommands,
+      groupBy,
+      lang,
+    ],
     queryFn: () =>
       api.buildExport({
         startDate,
         endDate,
         project,
-        visibility,
+        includeCommands,
         groupBy,
         lang,
         write: false,
@@ -112,12 +128,13 @@ export function useExportPreview(params: {
 export function useSearch(
   query: string,
   projectFilter: string | null,
-  visibility: PromptVisibility
+  includeCommands: boolean
 ) {
   const debounced = useDebounce(query.trim(), 300);
   const result = useQuery({
-    queryKey: ["search", debounced, projectFilter, visibility],
-    queryFn: () => api.searchPrompts(debounced, projectFilter, visibility),
+    queryKey: ["search", debounced, projectFilter, includeCommands],
+    queryFn: () =>
+      api.searchPrompts(debounced, projectFilter, includeCommands),
     enabled: debounced.length > 0,
     staleTime: 60 * 1000,
   });

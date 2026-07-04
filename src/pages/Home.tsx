@@ -8,7 +8,6 @@ import { StatsOverview } from "@/components/StatsOverview";
 import { ActivityChart, HourChart, ProjectChart } from "@/components/Charts";
 import { TokenStats } from "@/components/TokenStats";
 import { PromptList } from "@/components/PromptList";
-import { PromptVisibilityFilters } from "@/components/PromptVisibilityFilters";
 import {
   Card,
   CardContent,
@@ -81,12 +80,12 @@ function HomeRefreshingSkeleton() {
 }
 
 export function Home() {
-  const { promptVisibility } = useStore();
+  const { includeCommands } = useStore();
   const { refreshing } = useOutletContext<LayoutOutletContext>();
   const t = useT();
   const statsQ = useStats();
   const metaQ = useIndexMeta();
-  const recentQ = useRecentPrompts(24, promptVisibility);
+  const recentQ = useRecentPrompts(24, includeCommands);
 
   // memo 保持引用稳定：PromptList 以 items 引用变化作为重置分批的信号
   const recentItems = useMemo(
@@ -178,7 +177,6 @@ export function Home() {
             <h2 className="mb-3 text-sm font-semibold text-foreground">
               {t("recentPrompts")}
             </h2>
-            <PromptVisibilityFilters className="mb-3" />
             {recentQ.isLoading ? (
               <ListSkeleton />
             ) : recentQ.isError ? (

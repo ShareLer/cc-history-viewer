@@ -9,38 +9,9 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import type { PromptVisibility } from "@/lib/types";
 
 type Theme = "dark" | "light";
 export type SearchScope = "global" | "folder";
-
-const DEFAULT_PROMPT_VISIBILITY: PromptVisibility = {
-  includeCommands: true,
-  includeMeta: false,
-  includeSidechain: false,
-  includeSystem: false,
-  includeQueued: false,
-  includeSdk: false,
-  includeOther: false,
-};
-
-function loadPromptVisibility(): PromptVisibility {
-  const raw = localStorage.getItem("cchv-prompt-visibility");
-  if (raw) {
-    try {
-      const parsed = JSON.parse(raw) as Partial<PromptVisibility>;
-      return { ...DEFAULT_PROMPT_VISIBILITY, ...parsed };
-    } catch {
-      // fall through
-    }
-  }
-  const legacyIncludeCommands =
-    localStorage.getItem("cchv-include-commands") !== "false";
-  return {
-    ...DEFAULT_PROMPT_VISIBILITY,
-    includeCommands: legacyIncludeCommands,
-  };
-}
 
 interface Store {
   theme: Theme;
@@ -58,11 +29,6 @@ interface Store {
   includeCommands: boolean;
   setIncludeCommands: (b: boolean) => void;
 
-  /** 其它 prompt 类型的显示开关 */
-  promptVisibility: PromptVisibility;
-  setPromptVisibility: (key: keyof PromptVisibility, value: boolean) => void;
-  togglePromptVisibility: (key: keyof PromptVisibility) => void;
-
   /** 当前进入的文件夹（真实路径），用于「当前文件夹」搜索 */
   currentProject: string | null;
   currentProjectName: string | null;
@@ -77,11 +43,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
   const [query, setQuery] = useState("");
   const [scope, setScope] = useState<SearchScope>("global");
-  const [promptVisibility, setPromptVisibilityState] = useState<PromptVisibility>(
-    () => loadPromptVisibility()
-  );
   const [includeCommands, setIncludeCommandsState] = useState<boolean>(
-    () => loadPromptVisibility().includeCommands
+    () => localStorage.getItem("cchv-include-commands") !== "false"
   );
   const [currentProject, setCurrentProjectState] = useState<string | null>(
     null
@@ -95,17 +58,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     localStorage.setItem("cchv-theme", theme);
   }, [theme]);
 
-  useEffect(() => {
-    localStorage.setItem(
-      "cchv-prompt-visibility",
-      JSON.stringify(promptVisibility)
-    );
-    localStorage.setItem(
-      "cchv-include-commands",
-      String(promptVisibility.includeCommands)
-    );
-  }, [promptVisibility]);
-
   const toggleTheme = useCallback(
     () => setTheme((t) => (t === "dark" ? "light" : "dark")),
     []
@@ -113,32 +65,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const setIncludeCommands = useCallback((b: boolean) => {
     setIncludeCommandsState(b);
-    setPromptVisibilityState((v) => ({ ...v, includeCommands: b }));
     localStorage.setItem("cchv-include-commands", String(b));
   }, []);
-
-  const setPromptVisibility = useCallback(
-    (key: keyof PromptVisibility, value: boolean) => {
-      setPromptVisibilityState((v) => ({ ...v, [key]: value }));
-      if (key === "includeCommands") {
-        setIncludeCommandsState(value);
-      }
-    },
-    []
-  );
-
-  const togglePromptVisibility = useCallback(
-    (key: keyof PromptVisibility) => {
-      setPromptVisibilityState((v) => {
-        const next = { ...v, [key]: !v[key] } as PromptVisibility;
-        if (key === "includeCommands") {
-          setIncludeCommandsState(next.includeCommands);
-        }
-        return next;
-      });
-    },
-    []
-  );
 
   const setCurrentProject = useCallback(
     (path: string | null, name: string | null = null) => {
@@ -159,9 +87,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setScope,
       includeCommands,
       setIncludeCommands,
-      promptVisibility,
-      setPromptVisibility,
-      togglePromptVisibility,
       currentProject,
       currentProjectName,
       setCurrentProject,
@@ -173,9 +98,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       scope,
       includeCommands,
       setIncludeCommands,
-      promptVisibility,
-      setPromptVisibility,
-      togglePromptVisibility,
       currentProject,
       currentProjectName,
       setCurrentProject,

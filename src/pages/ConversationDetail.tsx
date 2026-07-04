@@ -235,7 +235,6 @@ export function ConversationDetail() {
   const { copied, copy } = useCopy();
 
   const [searchParams] = useSearchParams();
-  const targetUuid = searchParams.get("m");
   const targetTs = Number(searchParams.get("t")) || null;
   const [highlightIdx, setHighlightIdx] = useState<number | null>(null);
 
@@ -263,21 +262,16 @@ export function ConversationDetail() {
   const [exportError, setExportError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!data || data.messages.length === 0) return;
-    let best = targetUuid
-      ? data.messages.findIndex((m) => m.uuid === targetUuid)
-      : -1;
-    if (best < 0) {
-      if (!targetTs) return;
-      let bestDiff = Number.POSITIVE_INFINITY;
-      data.messages.forEach((m, i) => {
-        const diff = Math.abs(m.timestamp - targetTs);
-        if (diff < bestDiff) {
-          bestDiff = diff;
-          best = i;
-        }
-      });
-    }
+    if (!data || !targetTs || data.messages.length === 0) return;
+    let best = 0;
+    let bestDiff = Number.POSITIVE_INFINITY;
+    data.messages.forEach((m, i) => {
+      const diff = Math.abs(m.timestamp - targetTs);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        best = i;
+      }
+    });
     setHighlightIdx(best);
     requestAnimationFrame(() => {
       document
@@ -286,7 +280,7 @@ export function ConversationDetail() {
     });
     const timer = setTimeout(() => setHighlightIdx(null), 2500);
     return () => clearTimeout(timer);
-  }, [data, targetTs, targetUuid]);
+  }, [data, targetTs]);
 
   const effectiveViewOptions = useMemo<ViewOptions>(() => {
     if (!exportOpen) return viewOptions;

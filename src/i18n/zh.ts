@@ -66,16 +66,11 @@ export const zh = {
   sourceHistory: "输入历史",
   sourceConversation: "对话记录",
   sourceBoth: "历史 + 对话",
-  systemBadge: "系统",
-  queuedBadge: "排队",
-  sdkBadge: "SDK",
-  otherBadge: "其他",
   pastedCount: "{count} 处粘贴",
   charCount: "{count} 字",
   copyPrompt: "复制 prompt",
   viewConversation: "查看对话",
   showedCount: "已显示 {shown} / {total} 条，下拉加载更多",
-  otherKindsLabel: "其它类型",
 
   /* ----------------------------- Home 概览 ----------------------------- */
   overviewTitle: "概览",
@@ -144,7 +139,7 @@ export const zh = {
   messagesCount: "{count} 条消息",
   untitledSession: "（无 user 消息）",
   noPromptsInFolder: "该文件夹下暂无 prompt",
-  noPromptsInFolderHint: "调整上方筛选后再看。",
+  noPromptsInFolderHint: "若只剩斜杠命令，可在顶栏开启「命令」按钮查看。",
   noConversationsInFolder: "该文件夹下没有对话记录",
   noConversationsInFolderHint:
     "只有在 ~/.claude/projects 下有对话文件的文件夹才会显示会话。",

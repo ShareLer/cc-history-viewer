@@ -3,7 +3,6 @@
 //! 这里会第一时间报警。fixture 不含任何真实个人数据。
 
 use cc_history_viewer_lib::parser;
-use cc_history_viewer_lib::models::PromptKind;
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> PathBuf {
@@ -24,7 +23,6 @@ fn history_golden() {
     assert_eq!(out.len(), 3);
 
     assert_eq!(out[0].text, "帮我重构 parser 模块");
-    assert_eq!(out[0].kind, PromptKind::Human);
     assert_eq!(out[0].project, "/Users/dev/alpha");
     assert_eq!(out[0].timestamp, 1747363200000);
     assert_eq!(out[0].session_id.as_deref(), Some("sess-aaaa"));
@@ -32,11 +30,9 @@ fn history_golden() {
     assert!(out[0].from_history);
 
     assert_eq!(out[1].text, "/clear");
-    assert_eq!(out[1].kind, PromptKind::Command);
     assert!(out[1].session_id.is_none());
 
     assert_eq!(out[2].project, "/Users/dev/beta");
-    assert_eq!(out[2].kind, PromptKind::Human);
     assert_eq!(out[2].pasted_count, 1, "pastedContents 有 1 个键");
 }
 
@@ -53,29 +49,16 @@ fn session_golden() {
     assert_eq!(r.started_at, iso_ms("2026-05-16T02:00:00.000Z"));
     assert_eq!(r.ended_at, iso_ms("2026-05-16T02:01:35.000Z"));
     // 9 行 user/assistant 计入消息数（system/local_command 行不算消息）；
-    // isMeta=true 的 user 行仍会作为 prompt 保留，但会被标记为 Meta。
+    // isMeta=true 的 user 行仍是消息，但不应进入 prompt 索引。
     assert_eq!(r.message_count, 9);
 
-    // prompt 提取：tool_result-only 不算 prompt；Meta / Command / Sidechain 会被保留并打 kind。
+    // prompt 提取：tool_result-only 与 sidechain 的 user 行不算 prompt；
+    // <command-name> 包裹的斜杠命令提取为命令名本身
     let texts: Vec<&str> = r.user_prompts.iter().map(|p| p.text.as_str()).collect();
-    assert_eq!(
-        texts,
-        vec![
-            "帮我重构 parser 模块",
-            "Base directory for this skill: /Users/dev/.claude/skills/example\n\n# Example Skill",
-            "/model",
-            "子代理内部消息，不应计入 prompt",
-        ]
-    );
-    let kinds: Vec<PromptKind> = r.user_prompts.iter().map(|p| p.kind).collect();
-    assert_eq!(
-        kinds,
-        vec![
-            PromptKind::Human,
-            PromptKind::Meta,
-            PromptKind::Command,
-            PromptKind::Sidechain,
-        ]
+    assert_eq!(texts, vec!["帮我重构 parser 模块", "/model"]);
+    assert!(
+        !texts.iter().any(|t| t.contains("Base directory for this skill")),
+        "isMeta=true 的 skill 注入内容不应作为真实用户 prompt"
     );
     assert_eq!(r.first_prompt, "帮我重构 parser 模块");
     assert!(r.user_prompts.iter().all(|p| p.project == "/Users/dev/alpha"));
@@ -117,7 +100,7 @@ fn session_detail_golden() {
     assert_eq!(tool_msg.blocks[0].kind, "tool_use");
     assert_eq!(tool_msg.blocks[0].tool_name.as_deref(), Some("Bash"));
 
-    // Meta 行、命令行和 sidechain 行都保留在对话流里
+    // 斜杠命令的 user 消息在展示层被美化为「命令名」（标签噪声被剥离）
     assert!(d.messages[5].is_meta);
     assert_eq!(d.messages[5].role, "user");
     assert!(

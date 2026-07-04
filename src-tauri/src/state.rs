@@ -56,22 +56,6 @@ fn default_claude_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude"))
 }
 
-fn expand_user_path(raw: &str) -> PathBuf {
-    let trimmed = raw.trim();
-    if trimmed == "~" {
-        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(trimmed));
-    }
-    if let Some(rest) = trimmed
-        .strip_prefix("~/")
-        .or_else(|| trimmed.strip_prefix("~\\"))
-    {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(trimmed)
-}
-
 /// 读取并解析某个 settings.json（解析失败时返回全空配置）。
 fn read_settings_file(path: &Path) -> SettingsInput {
     fs::read_to_string(path)
@@ -104,7 +88,8 @@ pub fn save_settings(app: &AppHandle, s: &SettingsInput) -> Result<PathBuf, Stri
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
     }
-    let json = serde_json::to_string_pretty(s).map_err(|e| format!("序列化设置失败：{e}"))?;
+    let json =
+        serde_json::to_string_pretty(s).map_err(|e| format!("序列化设置失败：{e}"))?;
     fs::write(&path, json).map_err(|e| format!("写入配置文件失败：{e}"))?;
     Ok(path)
 }
@@ -115,13 +100,13 @@ pub fn resolve_from_settings(s: &SettingsInput) -> Result<DataPaths, String> {
     let base: Option<PathBuf> = if s.claude_data_dir.trim().is_empty() {
         default_claude_dir()
     } else {
-        Some(expand_user_path(&s.claude_data_dir))
+        Some(PathBuf::from(s.claude_data_dir.trim()))
     };
 
     // 单项优先用显式配置，否则在基准目录下推导
     let pick = |explicit: &str, sub: &str| -> Result<PathBuf, String> {
         if !explicit.trim().is_empty() {
-            Ok(expand_user_path(explicit))
+            Ok(PathBuf::from(explicit.trim()))
         } else {
             base.as_ref()
                 .map(|b| b.join(sub))

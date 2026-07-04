@@ -63,16 +63,7 @@ export function formatTokens(n: number): string {
 /** 把绝对路径压缩为可读短路径：/Users/xxx/... → ~/... */
 export function prettyPath(path: string): string {
   if (!path) return "";
-  return path
-    .replace(/^\/Users\/[^/]+/, "~")
-    .replace(/^\/home\/[^/]+/, "~")
-    .replace(/^[A-Za-z]:\\Users\\[^\\]+/, "~");
-}
-
-/** 取路径末级目录名，兼容 POSIX 与 Windows 分隔符。 */
-export function pathBaseName(path: string): string {
-  const trimmed = path.replace(/[\\/]+$/, "");
-  return trimmed.split(/[\\/]/).filter(Boolean).pop() || path;
+  return path.replace(/^\/Users\/[^/]+/, "~").replace(/^\/home\/[^/]+/, "~");
 }
 
 /** react-router 路由参数编码 */

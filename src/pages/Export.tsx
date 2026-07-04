@@ -6,12 +6,13 @@ import {
   Download,
   FileText,
   FolderOpen,
+  Terminal,
 } from "lucide-react";
 import { useExportPreview, useProjects, useStats } from "@/hooks/queries";
-import { useStore } from "@/store";
 import { api, errMessage } from "@/lib/api";
 import { useLang, useT, type DictKey } from "@/i18n";
 import {
+  Badge,
   Button,
   Card,
   CardContent,
@@ -19,7 +20,6 @@ import {
   CardTitle,
   Spinner,
 } from "@/components/ui";
-import { PromptVisibilityFilters } from "@/components/PromptVisibilityFilters";
 import { cn, formatNumber, prettyPath } from "@/lib/utils";
 import type { ExportGroupBy, ExportResult } from "@/lib/types";
 
@@ -52,7 +52,6 @@ const dateInputCls =
 export function Export() {
   const projectsQ = useProjects();
   const statsQ = useStats();
-  const { promptVisibility } = useStore();
   const t = useT();
   const { lang } = useLang();
 
@@ -60,6 +59,7 @@ export function Export() {
   const [startDate, setStartDate] = useState(() => fmtDay(subDays(today, 6)));
   const [endDate, setEndDate] = useState(() => fmtDay(today));
   const [project, setProject] = useState("");
+  const [includeCommands, setIncludeCommands] = useState(false);
   const [groupBy, setGroupBy] = useState<ExportGroupBy>("project");
 
   const [exporting, setExporting] = useState(false);
@@ -72,7 +72,7 @@ export function Export() {
     startDate,
     endDate,
     project: project || null,
-    visibility: promptVisibility,
+    includeCommands,
     groupBy,
     lang,
     enabled: rangeValid,
@@ -108,7 +108,7 @@ export function Export() {
         startDate,
         endDate,
         project: project || null,
-        visibility: promptVisibility,
+        includeCommands,
         groupBy,
         lang,
         write: true,
@@ -227,7 +227,21 @@ export function Export() {
             </Field>
           </div>
 
-          <PromptVisibilityFilters />
+          {/* 命令开关 */}
+          <button
+            onClick={() => setIncludeCommands((v) => !v)}
+            className={cn(
+              "flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors",
+              includeCommands
+                ? "border-accent/40 bg-accent/15 text-accent"
+                : "border-border text-muted hover:text-foreground"
+            )}
+          >
+            <Terminal size={13} />
+            {includeCommands
+              ? t("includeSlashCommands")
+              : t("excludeSlashCommands")}
+          </button>
         </CardContent>
       </Card>
 

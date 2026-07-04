@@ -13,7 +13,6 @@ import type {
   IndexMeta,
   ProjectInfo,
   PromptEntry,
-  PromptVisibility,
   SearchResult,
   SessionSummary,
   SettingsInput,
@@ -27,19 +26,27 @@ export const api = {
   getProjectPrompts: (
     project: string,
     sort: SortMode,
-    visibility: PromptVisibility
+    includeCommands: boolean
   ) =>
-    invoke<PromptEntry[]>("get_project_prompts", { project, sort, visibility }),
+    invoke<PromptEntry[]>("get_project_prompts", {
+      project,
+      sort,
+      includeCommands,
+    }),
 
-  getRecentPrompts: (limit: number, visibility: PromptVisibility) =>
-    invoke<PromptEntry[]>("get_recent_prompts", { limit, visibility }),
+  getRecentPrompts: (limit: number, includeCommands: boolean) =>
+    invoke<PromptEntry[]>("get_recent_prompts", { limit, includeCommands }),
 
   searchPrompts: (
     query: string,
     projectFilter: string | null,
-    visibility: PromptVisibility
+    includeCommands: boolean
   ) =>
-    invoke<SearchResult[]>("search_prompts", { query, projectFilter, visibility }),
+    invoke<SearchResult[]>("search_prompts", {
+      query,
+      projectFilter,
+      includeCommands,
+    }),
 
   getStats: () => invoke<AppStats>("get_stats"),
 
@@ -58,7 +65,7 @@ export const api = {
       startDate: p.startDate,
       endDate: p.endDate,
       project: p.project,
-      visibility: p.visibility,
+      includeCommands: p.includeCommands,
       groupBy: p.groupBy,
       write: p.write,
       lang: p.lang,
@@ -67,14 +74,14 @@ export const api = {
   exportSearchResults: (p: {
     query: string;
     projectFilter: string | null;
-    visibility: PromptVisibility;
+    includeCommands: boolean;
     write: boolean;
     lang?: string;
   }) =>
     invoke<ExportResult>("export_search_results", {
       query: p.query,
       projectFilter: p.projectFilter,
-      visibility: p.visibility,
+      includeCommands: p.includeCommands,
       write: p.write,
       lang: p.lang,
     }),
