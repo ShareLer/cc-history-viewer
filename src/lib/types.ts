@@ -1,6 +1,7 @@
 // 与 Rust src-tauri/src/models.rs 一一对应的类型定义。
 
 export type PromptSource = "history" | "conversation" | "both";
+export type AgentKind = "claudeCode" | "codex";
 export type PromptKind =
   | "human"
   | "command"
@@ -27,6 +28,7 @@ export interface PromptEntry {
   project: string;
   timestamp: number;
   source: PromptSource;
+  agent: AgentKind;
   kind: PromptKind;
   messageUuid: string | null;
   sessionId: string | null;
@@ -55,6 +57,7 @@ export interface SearchResult {
 export interface SessionSummary {
   sessionId: string;
   project: string;
+  agent: AgentKind;
   title: string;
   startedAt: number;
   endedAt: number;
@@ -80,6 +83,8 @@ export interface ContentBlock {
 export interface ChatMessage {
   uuid: string;
   role: "user" | "assistant" | "system";
+  phase: "commentary" | "final_answer" | string | null;
+  callId: string | null;
   timestamp: number;
   isSidechain: boolean;
   isMeta: boolean;
@@ -91,6 +96,7 @@ export interface ChatMessage {
 export interface ConversationDetail {
   sessionId: string;
   project: string;
+  agent: AgentKind;
   gitBranch: string | null;
   startedAt: number;
   endedAt: number;
@@ -234,15 +240,18 @@ export interface SettingsInput {
   historyFile: string;
   projectsDir: string;
   sessionsDir: string;
+  codexSessionsDir: string;
 }
 
 export interface ResolvedPaths {
   history: string;
   projects: string;
   sessions: string;
+  codexSessions: string;
   historyExists: boolean;
   projectsExists: boolean;
   sessionsExists: boolean;
+  codexSessionsExists: boolean;
 }
 
 export interface SettingsView extends SettingsInput {

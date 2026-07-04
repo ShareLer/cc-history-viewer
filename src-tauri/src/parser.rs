@@ -1,8 +1,8 @@
-//! JSONL 数据解析：history.jsonl 与 projects/**/*.jsonl。
+//! JSONL 数据解析：Claude history/projects 与 Codex sessions JSONL。
 
-use crate::models::{ChatMessage, ContentBlock, ConversationDetail, PromptKind};
+use crate::models::{AgentKind, ChatMessage, ContentBlock, ConversationDetail, PromptKind};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +15,7 @@ const MAX_BLOCK_CHARS: usize = 24_000;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawPrompt {
     pub text: String,
+    pub agent: AgentKind,
     pub project: String,
     pub timestamp: i64,
     pub kind: PromptKind,
@@ -47,6 +48,7 @@ pub struct UsageEntry {
 pub struct ConvFileResult {
     pub path: PathBuf,
     pub session_id: String,
+    pub agent: AgentKind,
     pub project: Option<String>,
     pub git_branch: Option<String>,
     pub version: Option<String>,
@@ -109,6 +111,7 @@ pub fn parse_history(path: &Path) -> Vec<RawPrompt> {
         };
         out.push(RawPrompt {
             text,
+            agent: AgentKind::ClaudeCode,
             project,
             timestamp,
             kind: classify_history_prompt_kind(&display),
@@ -313,6 +316,7 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
             .unwrap_or_default();
         user_prompts.push(RawPrompt {
             text: prompt_text,
+            agent: AgentKind::ClaudeCode,
             project: line_project,
             timestamp,
             kind,
@@ -354,6 +358,7 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
     Some(ConvFileResult {
         path: path.to_path_buf(),
         session_id,
+        agent: AgentKind::ClaudeCode,
         project,
         git_branch,
         version,
@@ -473,6 +478,8 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
                         messages.push(ChatMessage {
                             uuid: stable_uuid,
                             role: "system".to_string(),
+                            phase: None,
+                            call_id: None,
                             timestamp: ts.unwrap_or(0),
                             is_sidechain: false,
                             is_meta: parsed.is_meta.unwrap_or(false),
@@ -496,6 +503,8 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
                     messages.push(ChatMessage {
                         uuid: stable_uuid,
                         role: "system".to_string(),
+                        phase: None,
+                        call_id: None,
                         timestamp: ts.unwrap_or(0),
                         is_sidechain: parsed.is_sidechain.unwrap_or(false),
                         is_meta: parsed.is_meta.unwrap_or(false),
@@ -522,6 +531,8 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
         messages.push(ChatMessage {
             uuid: stable_uuid,
             role,
+            phase: None,
+            call_id: None,
             timestamp: ts.unwrap_or(0),
             is_sidechain: parsed.is_sidechain.unwrap_or(false),
             is_meta: parsed.is_meta.unwrap_or(false),
@@ -541,12 +552,838 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
     Some(ConversationDetail {
         session_id,
         project: project.unwrap_or_default(),
+        agent: AgentKind::ClaudeCode,
         git_branch,
         started_at,
         ended_at,
         version,
         messages,
     })
+}
+
+// --------------------------- Codex sessions JSONL ---------------------------
+
+#[derive(Deserialize)]
+struct CodexLine {
+    #[serde(rename = "type")]
+    line_type: Option<String>,
+    timestamp: Option<String>,
+    payload: Option<serde_json::Value>,
+}
+
+#[derive(Default)]
+struct CodexMeta {
+    session_id: Option<String>,
+    project: Option<String>,
+    git_branch: Option<String>,
+    version: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Clone)]
+struct CodexUserEvent {
+    timestamp: i64,
+    text: String,
+}
+
+/// 解析单个 Codex session 文件，提取真实 user prompt 与会话摘要信息。
+///
+/// Codex JSONL 中同一条用户输入通常会同时出现：
+/// - `response_item` + `payload.type=message` + `role=user`：进入 Responses 上下文的 item；
+/// - `event_msg` + `payload.type=user_message`：客户端事件流。
+///
+/// 这里优先采用 `event_msg.user_message` 作为真实用户输入，避免把上下文注入
+/// （如 AGENTS.md、environment_context）误当作 prompt；若文件缺少事件流再退回 response item。
+pub fn parse_codex_session_file(path: &Path) -> Option<ConvFileResult> {
+    let content = fs::read_to_string(path).ok()?;
+    let file_stem = path.file_stem()?.to_string_lossy().to_string();
+
+    let mut meta = CodexMeta::default();
+    let mut started_at = i64::MAX;
+    let mut ended_at = i64::MIN;
+    let mut message_count = 0usize;
+    let mut first_prompt = String::new();
+    let mut event_prompts: Vec<CodexUserEvent> = Vec::new();
+    let mut fallback_prompts: Vec<CodexUserEvent> = Vec::new();
+    let mut usage_entries: Vec<UsageEntry> = Vec::new();
+    let mut seen_usage_keys: HashSet<String> = HashSet::new();
+
+    for (line_no, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let too_big = line.len() > MAX_LINE_FOR_PROMPT;
+        let parsed: CodexLine = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let ts = parsed.timestamp.as_deref().and_then(iso_to_ms);
+        if let Some(t) = ts {
+            if t < started_at {
+                started_at = t;
+            }
+            if t > ended_at {
+                ended_at = t;
+            }
+        }
+        let payload = match parsed.payload.as_ref() {
+            Some(p) => p,
+            None => continue,
+        };
+        match parsed.line_type.as_deref().unwrap_or("") {
+            "session_meta" => apply_codex_session_meta(payload, &mut meta),
+            "turn_context" => apply_codex_turn_context(payload, &mut meta),
+            "event_msg" => {
+                if payload.get("type").and_then(|v| v.as_str()) == Some("user_message") {
+                    if !too_big {
+                        if let Some(text) = payload
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .and_then(clean_prompt_text)
+                        {
+                            if let Some(t) = ts {
+                                event_prompts.push(CodexUserEvent { timestamp: t, text });
+                                message_count += 1;
+                            }
+                        }
+                    }
+                } else if payload.get("type").and_then(|v| v.as_str()) == Some("task_complete") {
+                    // 仅表示一轮任务结束，不是独立对话消息。
+                } else if payload.get("type").and_then(|v| v.as_str()) == Some("token_count") {
+                    if let Some(e) = extract_codex_usage_entry(
+                        payload,
+                        &file_stem,
+                        line_no,
+                        ts,
+                        &meta,
+                        &mut seen_usage_keys,
+                    ) {
+                        usage_entries.push(e);
+                    }
+                }
+            }
+            "response_item" => {
+                let ptype = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if ptype == "message" {
+                    match payload.get("role").and_then(|v| v.as_str()).unwrap_or("") {
+                        "assistant" => {
+                            // 仅统计最终回答/中间展示消息，developer/system 不属于对话流。
+                            message_count += 1;
+                        }
+                        "user" if !too_big => {
+                            if let Some(text) = codex_response_message_text(payload)
+                                .and_then(|s| clean_prompt_text(&s))
+                            {
+                                if !is_codex_context_injection(&text) {
+                                    if let Some(t) = ts {
+                                        fallback_prompts
+                                            .push(CodexUserEvent { timestamp: t, text });
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let session_id = meta.session_id.clone().unwrap_or(file_stem);
+    let project = meta.project.clone().unwrap_or_default();
+    let chosen = if event_prompts.is_empty() {
+        fallback_prompts
+    } else {
+        event_prompts
+    };
+    let mut user_prompts = Vec::new();
+    for (idx, p) in chosen.into_iter().enumerate() {
+        if first_prompt.is_empty() {
+            first_prompt = p.text.clone();
+        }
+        let stable_uuid = format!("{session_id}:user:{}", idx + 1);
+        user_prompts.push(RawPrompt {
+            text: p.text,
+            agent: AgentKind::Codex,
+            project: project.clone(),
+            timestamp: p.timestamp,
+            kind: PromptKind::Human,
+            origin_key: format!("codex:{session_id}:{stable_uuid}"),
+            message_uuid: Some(stable_uuid),
+            session_id: Some(provider_session_id(AgentKind::Codex, &session_id)),
+            git_branch: meta.git_branch.clone(),
+            pasted_count: 0,
+            from_history: false,
+        });
+    }
+
+    if started_at == i64::MAX {
+        started_at = 0;
+    }
+    if ended_at == i64::MIN {
+        ended_at = 0;
+    }
+
+    Some(ConvFileResult {
+        path: path.to_path_buf(),
+        session_id: provider_session_id(AgentKind::Codex, &session_id),
+        agent: AgentKind::Codex,
+        project: meta.project,
+        git_branch: meta.git_branch,
+        version: meta.version,
+        started_at,
+        ended_at,
+        message_count,
+        first_prompt,
+        user_prompts,
+        usage_entries,
+    })
+}
+
+/// 解析 Codex 对话详情。详情页展示采用 response_item 作为主数据源：
+/// 它包含 assistant 文本、reasoning、工具调用与工具结果；event_msg 只补充 user_message。
+pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail> {
+    let content = fs::read_to_string(path).ok()?;
+    let file_stem = path.file_stem()?.to_string_lossy().to_string();
+
+    let mut meta = CodexMeta::default();
+    let mut started_at = i64::MAX;
+    let mut ended_at = i64::MIN;
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    let event_user_prompts = collect_codex_event_user_prompts(&content);
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    let mut event_user_idx = 0usize;
+    let mut fallback_user_idx = 0usize;
+
+    for (line_no, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parsed: CodexLine = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let ts = parsed.timestamp.as_deref().and_then(iso_to_ms);
+        if let Some(t) = ts {
+            if t < started_at {
+                started_at = t;
+            }
+            if t > ended_at {
+                ended_at = t;
+            }
+        }
+        let payload = match parsed.payload.as_ref() {
+            Some(p) => p,
+            None => continue,
+        };
+        let stable_uuid =
+            codex_payload_id(payload).unwrap_or_else(|| format!("{}:{}", file_stem, line_no + 1));
+
+        match parsed.line_type.as_deref().unwrap_or("") {
+            "session_meta" => apply_codex_session_meta(payload, &mut meta),
+            "turn_context" => apply_codex_turn_context(payload, &mut meta),
+            "event_msg" => {
+                if payload.get("type").and_then(|v| v.as_str()) == Some("user_message") {
+                    let raw = payload
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if let Some(text) = clean_prompt_text(raw) {
+                        event_user_idx += 1;
+                        let raw_session_id =
+                            meta.session_id.clone().unwrap_or_else(|| file_stem.clone());
+                        messages.push(ChatMessage {
+                            uuid: format!("{raw_session_id}:user:{event_user_idx}"),
+                            role: "user".to_string(),
+                            phase: None,
+                            call_id: None,
+                            timestamp: ts.unwrap_or(0),
+                            is_sidechain: false,
+                            is_meta: false,
+                            meta_kind: None,
+                            attribution_skill: None,
+                            blocks: vec![ContentBlock {
+                                kind: "text".to_string(),
+                                text: Some(truncate(&text)),
+                                tool_name: None,
+                                tool_input: None,
+                            }],
+                        });
+                    }
+                }
+            }
+            "response_item" => {
+                if let Some(mut msg) =
+                    codex_response_item_to_message(payload, &stable_uuid, ts, &mut call_names)
+                {
+                    if msg.role == "user" {
+                        let text = msg
+                            .blocks
+                            .iter()
+                            .filter(|b| b.kind == "text")
+                            .filter_map(|b| b.text.as_deref())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if has_near_codex_event_user(&event_user_prompts, ts, &text)
+                            || is_codex_context_injection(&text)
+                        {
+                            continue;
+                        }
+                        if event_user_prompts.is_empty() {
+                            fallback_user_idx += 1;
+                            let raw_session_id =
+                                meta.session_id.clone().unwrap_or_else(|| file_stem.clone());
+                            msg.uuid = format!("{raw_session_id}:user:{fallback_user_idx}");
+                        }
+                    }
+                    messages.push(msg);
+                }
+            }
+            "compacted" => {
+                remove_codex_compaction_summary(&mut messages, payload);
+            }
+            _ => {}
+        }
+    }
+
+    if started_at == i64::MAX {
+        started_at = 0;
+    }
+    if ended_at == i64::MIN {
+        ended_at = 0;
+    }
+    let raw_session_id = meta.session_id.clone().unwrap_or(file_stem);
+    Some(ConversationDetail {
+        session_id: provider_session_id(AgentKind::Codex, &raw_session_id),
+        project: meta.project.unwrap_or_default(),
+        agent: AgentKind::Codex,
+        git_branch: meta.git_branch,
+        started_at,
+        ended_at,
+        version: meta.version,
+        messages: group_codex_tool_results(messages),
+    })
+}
+
+fn remove_codex_compaction_summary(messages: &mut Vec<ChatMessage>, payload: &serde_json::Value) {
+    let compacted_text = payload
+        .get("message")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("summary").and_then(|v| v.as_str()))
+        .or_else(|| payload.as_str())
+        .unwrap_or("")
+        .trim();
+    let Some(last) = messages.last() else {
+        return;
+    };
+    if last.role != "assistant" || last.phase.as_deref() != Some("final_answer") {
+        return;
+    }
+    let last_text = message_text(last);
+    if compaction_payload_contains_message(compacted_text, &last_text)
+        || looks_like_codex_compaction_summary(&last_text)
+    {
+        messages.pop();
+    }
+}
+
+fn compaction_payload_contains_message(compacted_text: &str, message: &str) -> bool {
+    let message = message.trim();
+    if message.is_empty() {
+        return false;
+    }
+    if compacted_text.contains(message) {
+        return true;
+    }
+    let prefix: String = message.chars().take(1_000).collect();
+    prefix.len() >= 40 && compacted_text.contains(prefix.trim())
+}
+
+fn looks_like_codex_compaction_summary(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("**Task Context**")
+        || trimmed.starts_with("**Task state**")
+        || trimmed.starts_with("**Workspace / User Goal**")
+        || trimmed.starts_with("**Handoff Summary**")
+        || trimmed.starts_with("- User request:")
+        || trimmed.starts_with("- User asked:")
+}
+
+fn group_codex_tool_results(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let call_ids: HashSet<String> = messages
+        .iter()
+        .filter(|msg| is_tool_call_message(msg))
+        .filter_map(|msg| msg.call_id.clone())
+        .collect();
+    let mut output_by_call: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+    for msg in messages.iter() {
+        if is_tool_result_message(msg) {
+            if let Some(call_id) = msg.call_id.clone() {
+                if call_ids.contains(&call_id) {
+                    output_by_call.entry(call_id).or_default().push(msg.clone());
+                }
+            }
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(messages.len());
+    for msg in messages {
+        if is_tool_result_message(&msg) {
+            if msg
+                .call_id
+                .as_ref()
+                .is_some_and(|call_id| call_ids.contains(call_id))
+            {
+                continue;
+            }
+        }
+        let call_id = msg.call_id.clone();
+        let is_call = is_tool_call_message(&msg);
+        ordered.push(msg);
+        if is_call {
+            if let Some(call_id) = call_id {
+                if let Some(mut outputs) = output_by_call.remove(&call_id) {
+                    ordered.append(&mut outputs);
+                }
+            }
+        }
+    }
+    for msg in output_by_call.into_values().flatten() {
+        ordered.push(msg);
+    }
+    ordered
+}
+
+fn is_tool_call_message(msg: &ChatMessage) -> bool {
+    msg.blocks.iter().any(|b| b.kind == "tool_use")
+}
+
+fn is_tool_result_message(msg: &ChatMessage) -> bool {
+    msg.blocks.iter().any(|b| b.kind == "tool_result")
+}
+
+fn message_text(msg: &ChatMessage) -> String {
+    msg.blocks
+        .iter()
+        .filter(|b| b.kind == "text")
+        .filter_map(|b| b.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn provider_session_id(agent: AgentKind, raw: &str) -> String {
+    match agent {
+        AgentKind::ClaudeCode => raw.to_string(),
+        AgentKind::Codex => format!("codex:{raw}"),
+    }
+}
+
+pub fn display_session_id(agent: AgentKind, session_id: &str) -> String {
+    match agent {
+        AgentKind::ClaudeCode => session_id.to_string(),
+        AgentKind::Codex => session_id
+            .strip_prefix("codex:")
+            .unwrap_or(session_id)
+            .to_string(),
+    }
+}
+
+fn apply_codex_session_meta(payload: &serde_json::Value, meta: &mut CodexMeta) {
+    if meta.session_id.is_none() {
+        meta.session_id = payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| payload.get("id").and_then(|v| v.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+    if meta.project.is_none() {
+        meta.project = payload
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+    if meta.git_branch.is_none() {
+        meta.git_branch = payload
+            .get("git")
+            .and_then(|v| v.get("branch"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+    if meta.version.is_none() {
+        meta.version = payload
+            .get("cli_version")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+}
+
+fn apply_codex_turn_context(payload: &serde_json::Value, meta: &mut CodexMeta) {
+    if meta.project.is_none() {
+        meta.project = payload
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+    if meta.model.is_none() {
+        meta.model = payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+}
+
+fn extract_codex_usage_entry(
+    payload: &serde_json::Value,
+    file_stem: &str,
+    line_no: usize,
+    ts: Option<i64>,
+    meta: &CodexMeta,
+    seen: &mut HashSet<String>,
+) -> Option<UsageEntry> {
+    let info = payload.get("info")?;
+    let total = info.get("total_token_usage")?;
+    let last = info.get("last_token_usage").unwrap_or(total);
+    let input = last
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .saturating_sub(
+            last.get("cached_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        );
+    let cache_read = last
+        .get("cached_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output = last
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if input == 0 && output == 0 && cache_read == 0 {
+        return None;
+    }
+    let key = format!("codex:{file_stem}:token_count:{}", line_no + 1);
+    if !seen.insert(key.clone()) {
+        return None;
+    }
+    Some(UsageEntry {
+        dedup_key: key,
+        model: meta.model.clone().unwrap_or_else(|| "codex".to_string()),
+        timestamp: ts.unwrap_or(0),
+        input,
+        output,
+        cache_read,
+        cache_creation: 0,
+    })
+}
+
+fn codex_response_item_to_message(
+    payload: &serde_json::Value,
+    stable_uuid: &str,
+    ts: Option<i64>,
+    call_names: &mut HashMap<String, String>,
+) -> Option<ChatMessage> {
+    let ptype = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match ptype {
+        "message" => {
+            let role = payload
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("assistant");
+            if role != "user" && role != "assistant" {
+                return None;
+            }
+            let blocks = codex_message_content_blocks(payload.get("content"), role)?;
+            Some(ChatMessage {
+                uuid: stable_uuid.to_string(),
+                role: role.to_string(),
+                phase: payload
+                    .get("phase")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                call_id: None,
+                timestamp: ts.unwrap_or(0),
+                is_sidechain: false,
+                is_meta: false,
+                meta_kind: None,
+                attribution_skill: None,
+                blocks,
+            })
+        }
+        "reasoning" => {
+            let blocks = codex_reasoning_blocks(payload);
+            if blocks.is_empty() {
+                return None;
+            }
+            Some(ChatMessage {
+                uuid: stable_uuid.to_string(),
+                role: "assistant".to_string(),
+                phase: None,
+                call_id: None,
+                timestamp: ts.unwrap_or(0),
+                is_sidechain: false,
+                is_meta: false,
+                meta_kind: None,
+                attribution_skill: None,
+                blocks,
+            })
+        }
+        "function_call" | "custom_tool_call" | "web_search_call" | "tool_search_call" => {
+            let call_id = payload
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(stable_uuid);
+            let name = codex_tool_name(payload, ptype);
+            call_names.insert(call_id.to_string(), name.clone());
+            let input = payload
+                .get("arguments")
+                .cloned()
+                .or_else(|| payload.get("input").cloned())
+                .or_else(|| payload.get("action").cloned());
+            Some(ChatMessage {
+                uuid: stable_uuid.to_string(),
+                role: "assistant".to_string(),
+                phase: None,
+                call_id: Some(call_id.to_string()),
+                timestamp: ts.unwrap_or(0),
+                is_sidechain: false,
+                is_meta: false,
+                meta_kind: None,
+                attribution_skill: None,
+                blocks: vec![ContentBlock {
+                    kind: "tool_use".to_string(),
+                    text: None,
+                    tool_name: Some(name),
+                    tool_input: input.map(normalize_tool_input),
+                }],
+            })
+        }
+        "function_call_output"
+        | "custom_tool_call_output"
+        | "web_search_end"
+        | "tool_search_output" => {
+            let call_id = payload
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(stable_uuid);
+            let name = call_names.get(call_id).cloned();
+            let text = codex_tool_output_text(payload);
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(ChatMessage {
+                uuid: stable_uuid.to_string(),
+                role: "user".to_string(),
+                phase: None,
+                call_id: Some(call_id.to_string()),
+                timestamp: ts.unwrap_or(0),
+                is_sidechain: false,
+                is_meta: false,
+                meta_kind: None,
+                attribution_skill: None,
+                blocks: vec![ContentBlock {
+                    kind: "tool_result".to_string(),
+                    text: Some(truncate(text.trim())),
+                    tool_name: name,
+                    tool_input: None,
+                }],
+            })
+        }
+        _ => None,
+    }
+}
+
+fn codex_message_content_blocks(
+    content: Option<&serde_json::Value>,
+    role: &str,
+) -> Option<Vec<ContentBlock>> {
+    let arr = content?.as_array()?;
+    let mut blocks = Vec::new();
+    for b in arr {
+        let bt = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match bt {
+            "input_text" | "output_text" => {
+                if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                    let t = prettify_display_text(t).trim().to_string();
+                    if !t.is_empty() {
+                        blocks.push(ContentBlock {
+                            kind: "text".to_string(),
+                            text: Some(truncate(&t)),
+                            tool_name: None,
+                            tool_input: None,
+                        });
+                    }
+                }
+            }
+            "input_image" | "image" => blocks.push(ContentBlock {
+                kind: "image".to_string(),
+                text: Some("[图片]".to_string()),
+                tool_name: None,
+                tool_input: None,
+            }),
+            "summary_text" if role == "assistant" => {
+                if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                    blocks.push(ContentBlock {
+                        kind: "thinking".to_string(),
+                        text: Some(truncate(t.trim())),
+                        tool_name: None,
+                        tool_input: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    (!blocks.is_empty()).then_some(blocks)
+}
+
+fn codex_response_message_text(payload: &serde_json::Value) -> Option<String> {
+    let blocks = codex_message_content_blocks(payload.get("content"), "user")?;
+    let text = blocks
+        .into_iter()
+        .filter(|b| b.kind == "text" || b.kind == "image")
+        .filter_map(|b| b.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn codex_reasoning_blocks(payload: &serde_json::Value) -> Vec<ContentBlock> {
+    let mut out = Vec::new();
+    if let Some(arr) = payload.get("summary").and_then(|v| v.as_array()) {
+        for item in arr {
+            let text = item
+                .get("text")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("summary_text").and_then(|v| v.as_str()));
+            if let Some(t) = text.map(str::trim).filter(|t| !t.is_empty()) {
+                out.push(ContentBlock {
+                    kind: "thinking".to_string(),
+                    text: Some(truncate(t)),
+                    tool_name: None,
+                    tool_input: None,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn codex_tool_name(payload: &serde_json::Value, ptype: &str) -> String {
+    payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("tool").and_then(|v| v.as_str()))
+        .unwrap_or(match ptype {
+            "web_search_call" => "web_search",
+            "tool_search_call" => "tool_search",
+            "custom_tool_call" => "custom_tool",
+            _ => "tool",
+        })
+        .to_string()
+}
+
+fn normalize_tool_input(v: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::String(s) = &v {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+            return parsed;
+        }
+    }
+    v
+}
+
+fn codex_tool_output_text(payload: &serde_json::Value) -> String {
+    for key in ["output", "message", "stdout", "stderr"] {
+        if let Some(v) = payload.get(key) {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+            if !v.is_null() {
+                return serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
+            }
+        }
+    }
+    serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string())
+}
+
+fn codex_payload_id(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("id")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("call_id").and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn collect_codex_event_user_prompts(content: &str) -> Vec<CodexUserEvent> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parsed: CodexLine = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if parsed.line_type.as_deref() != Some("event_msg") {
+            continue;
+        }
+        let payload = match parsed.payload.as_ref() {
+            Some(p) => p,
+            None => continue,
+        };
+        if payload.get("type").and_then(|v| v.as_str()) != Some("user_message") {
+            continue;
+        }
+        let Some(text) = payload
+            .get("message")
+            .and_then(|v| v.as_str())
+            .and_then(clean_prompt_text)
+        else {
+            continue;
+        };
+        let Some(timestamp) = parsed.timestamp.as_deref().and_then(iso_to_ms) else {
+            continue;
+        };
+        out.push(CodexUserEvent { timestamp, text });
+    }
+    out
+}
+
+fn has_near_codex_event_user(events: &[CodexUserEvent], ts: Option<i64>, text: &str) -> bool {
+    let Some(ts) = ts else {
+        return false;
+    };
+    let text = text.trim();
+    events
+        .iter()
+        .any(|e| e.text.trim() == text && e.timestamp.abs_diff(ts) <= 5_000)
+}
+
+fn is_codex_context_injection(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("# AGENTS.md instructions")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<permissions instructions>")
+        || trimmed.starts_with("<app-context>")
+        || trimmed.starts_with("<collaboration_mode>")
+        || trimmed.starts_with("<skills_instructions>")
+        || trimmed.starts_with("<plugins_instructions>")
+        || trimmed.starts_with("[system]")
 }
 
 fn skill_attachment_blocks(attachment: Option<&ConvAttachment>) -> Option<Vec<ContentBlock>> {
@@ -616,10 +1453,7 @@ fn classify_history_prompt_kind(display: &str) -> PromptKind {
     }
 }
 
-fn classify_conversation_prompt_kind(
-    line: &ConvLine,
-    content: &serde_json::Value,
-) -> PromptKind {
+fn classify_conversation_prompt_kind(line: &ConvLine, content: &serde_json::Value) -> PromptKind {
     if line.is_sidechain.unwrap_or(false) {
         return PromptKind::Sidechain;
     }
@@ -628,9 +1462,7 @@ fn classify_conversation_prompt_kind(
     if line.is_meta.unwrap_or(false) {
         return PromptKind::Meta;
     }
-    if matches!(origin_kind, Some("task-notification"))
-        || matches!(prompt_source, Some("system"))
-    {
+    if matches!(origin_kind, Some("task-notification")) || matches!(prompt_source, Some("system")) {
         return PromptKind::System;
     }
     if matches!(origin_kind, Some("human")) {
@@ -702,15 +1534,11 @@ fn looks_like_command_text(raw: &str) -> bool {
     if is_path_like_slash_text(trimmed) {
         return false;
     }
-    let cmd = trimmed[1..]
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim();
+    let cmd = trimmed[1..].split_whitespace().next().unwrap_or("").trim();
     !cmd.is_empty()
-        && cmd.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.' | '+')
-        })
+        && cmd
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.' | '+'))
 }
 
 fn is_path_like_slash_text(raw: &str) -> bool {
@@ -1103,6 +1931,200 @@ mod tests {
     }
 
     #[test]
+    fn codex_session_uses_event_user_message_and_parses_detail() {
+        let dir =
+            std::env::temp_dir().join(format!("cc_history_viewer_codex_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("rollout-2026-07-04T00-00-00-abc.jsonl");
+        let jsonl = [
+            json!({
+                "timestamp": "2026-07-04T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": "abc",
+                    "cwd": "/tmp/proj",
+                    "cli_version": "0.142.5",
+                    "git": {"branch": "main"}
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:00.100Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "<environment_context>noise</environment_context>"}]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "真实问题"}]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:01.000Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "真实问题", "images": []}
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:02.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "msg1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "回答"}],
+                    "phase": "final_answer"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:02.500Z",
+                "type": "compacted",
+                "payload": {
+                    "message": "Another language model started to solve this problem. Here is the summary produced by the other language model:\n回答"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:03.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "id": "fc1",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"pwd\"}",
+                    "call_id": "call1"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:03.100Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "id": "fc2",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"ls\"}",
+                    "call_id": "call2"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:04.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call1",
+                    "output": "ok"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:04.100Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call2",
+                    "output": "ls ok"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:04.500Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "msg2",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "真实最终回答"}],
+                    "phase": "final_answer"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:05.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 10,
+                            "cached_input_tokens": 4,
+                            "output_tokens": 2
+                        },
+                        "total_token_usage": {
+                            "input_tokens": 10,
+                            "cached_input_tokens": 4,
+                            "output_tokens": 2
+                        }
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let parsed = parse_codex_session_file(&path).unwrap();
+        assert_eq!(parsed.session_id, "codex:abc");
+        assert_eq!(parsed.agent, AgentKind::Codex);
+        assert_eq!(parsed.project.as_deref(), Some("/tmp/proj"));
+        assert_eq!(parsed.git_branch.as_deref(), Some("main"));
+        assert_eq!(parsed.first_prompt, "真实问题");
+        assert_eq!(parsed.user_prompts.len(), 1);
+        assert_eq!(parsed.user_prompts[0].text, "真实问题");
+        assert_eq!(parsed.usage_entries.len(), 1);
+        assert_eq!(parsed.usage_entries[0].input, 6);
+        assert_eq!(parsed.usage_entries[0].cache_read, 4);
+        assert_eq!(parsed.usage_entries[0].output, 2);
+
+        let detail = parse_codex_conversation_detail(&path).unwrap();
+        assert_eq!(detail.session_id, "codex:abc");
+        assert_eq!(detail.agent, AgentKind::Codex);
+        assert_eq!(
+            detail
+                .messages
+                .iter()
+                .filter(|m| m.role == "user" && m.blocks.iter().any(|b| b.kind == "text"))
+                .count(),
+            1
+        );
+        assert!(detail.messages.iter().any(|m| m.role == "assistant"
+            && m.phase.as_deref() == Some("final_answer")
+            && m.blocks
+                .iter()
+                .any(|b| b.text.as_deref() == Some("真实最终回答"))));
+        assert!(
+            !detail
+                .messages
+                .iter()
+                .any(|m| m.blocks.iter().any(|b| b.text.as_deref() == Some("回答"))),
+            "compacted 前置摘要不应作为最终回答展示"
+        );
+        assert!(detail
+            .messages
+            .iter()
+            .any(|m| m.blocks.iter().any(|b| b.kind == "tool_use")));
+        assert!(detail
+            .messages
+            .iter()
+            .any(|m| m.blocks.iter().any(|b| b.kind == "tool_result")));
+        let tool_call_ids: Vec<Option<&str>> = detail
+            .messages
+            .iter()
+            .filter(|m| is_tool_call_message(m) || is_tool_result_message(m))
+            .map(|m| m.call_id.as_deref())
+            .collect();
+        assert_eq!(
+            tool_call_ids,
+            vec![Some("call1"), Some("call1"), Some("call2"), Some("call2")]
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
     fn classify_history_slash_path_as_human() {
         assert_eq!(
             classify_history_prompt_kind("/Users/didi/Documents/codes/project"),
@@ -1208,7 +2230,10 @@ mod tests {
             Some("superpowers:requesting-code-review")
         );
         assert_eq!(
-            msg.blocks.iter().map(|b| b.kind.as_str()).collect::<Vec<_>>(),
+            msg.blocks
+                .iter()
+                .map(|b| b.kind.as_str())
+                .collect::<Vec<_>>(),
             vec!["text"]
         );
 

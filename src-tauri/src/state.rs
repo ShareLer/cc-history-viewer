@@ -27,6 +27,7 @@ pub struct DataPaths {
     pub history: PathBuf,
     pub projects: PathBuf,
     pub sessions: PathBuf,
+    pub codex_sessions: PathBuf,
 }
 
 /// 项目根目录（src-tauri 的上级），编译期确定。
@@ -54,6 +55,11 @@ pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
 /// 默认数据目录 ~/.claude
 fn default_claude_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude"))
+}
+
+/// 默认 Codex sessions 目录 ~/.codex/sessions
+fn default_codex_sessions_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".codex").join("sessions"))
 }
 
 fn expand_user_path(raw: &str) -> PathBuf {
@@ -133,6 +139,13 @@ pub fn resolve_from_settings(s: &SettingsInput) -> Result<DataPaths, String> {
         history: pick(&s.history_file, "history.jsonl")?,
         projects: pick(&s.projects_dir, "projects")?,
         sessions: pick(&s.sessions_dir, "sessions")?,
+        codex_sessions: if s.codex_sessions_dir.trim().is_empty() {
+            default_codex_sessions_dir().ok_or_else(|| {
+                "无法定位 Codex sessions 目录：请在设置中填写 codexSessionsDir。".to_string()
+            })?
+        } else {
+            expand_user_path(&s.codex_sessions_dir)
+        },
     })
 }
 

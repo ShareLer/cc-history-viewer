@@ -2,7 +2,9 @@
 //! 不重新解析任何 JSONL —— 数据全部来自 indexer 产出的 PromptEntry / parser 产出的 ConversationDetail。
 //! 所有用户可见文案支持 zh / en（由 lang 参数控制，默认 zh）。
 
-use crate::models::{ChatMessage, ContentBlock, ConversationDetail, PromptEntry, PromptVisibility};
+use crate::models::{
+    AgentKind, ChatMessage, ContentBlock, ConversationDetail, PromptEntry, PromptVisibility,
+};
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use std::collections::{HashMap, HashSet};
 
@@ -134,7 +136,7 @@ pub fn build(prompts: &[PromptEntry], p: &ExportParams) -> ExportData {
     let mut md = String::new();
     match lang {
         Lang::Zh => {
-            md.push_str("# Claude Code Prompt 导出\n\n");
+            md.push_str("# Prompt 导出\n\n");
             md.push_str(&format!(
                 "> **时间范围**　{} ~ {}\n",
                 p.start_date, p.end_date
@@ -145,7 +147,7 @@ pub fn build(prompts: &[PromptEntry], p: &ExportParams) -> ExportData {
             md.push_str(&format!("> **导出于**　{}\n\n", now_label()));
         }
         Lang::En => {
-            md.push_str("# Claude Code Prompt Export\n\n");
+            md.push_str("# Prompt Export\n\n");
             md.push_str(&format!(
                 "> **Time range**　{} ~ {}\n",
                 p.start_date, p.end_date
@@ -411,7 +413,7 @@ pub fn build_conversation_markdown(
         if body.is_empty() {
             continue; // 整条消息没有可渲染内容（如仅含工具块且未勾选包含工具）
         }
-        let who = message_label(m, lang);
+        let who = message_label(m, detail.agent, lang);
         let side = if m.is_sidechain {
             label("（子代理）", " (subagent)")
         } else {
@@ -447,8 +449,8 @@ pub fn build_conversation_markdown(
     if let Some(v) = detail.version.as_deref().filter(|v| !v.is_empty()) {
         md.push_str(&format!(
             "> **{}**　{}\n",
-            label("CC 版本", "CC version"),
-            v
+            label("版本", "Version"),
+            format!("{} {}", agent_name(detail.agent), v)
         ));
     }
     md.push_str(&format!(
@@ -549,7 +551,7 @@ fn message_time(m: &ChatMessage, options: &ConversationExportOptions) -> String 
     }
 }
 
-fn message_label(m: &ChatMessage, lang: Lang) -> &'static str {
+fn message_label(m: &ChatMessage, agent: AgentKind, lang: Lang) -> &'static str {
     match (m.role.as_str(), m.meta_kind.as_deref()) {
         ("user", _) => match lang {
             Lang::Zh if m.is_meta => "⚙ Meta",
@@ -570,9 +572,16 @@ fn message_label(m: &ChatMessage, lang: Lang) -> &'static str {
             Lang::En => "⚙ System",
         },
         _ => match lang {
-            Lang::Zh => "🤖 Claude",
-            Lang::En => "🤖 Claude",
+            Lang::Zh => agent_name(agent),
+            Lang::En => agent_name(agent),
         },
+    }
+}
+
+fn agent_name(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::ClaudeCode => "Claude Code",
+        AgentKind::Codex => "Codex",
     }
 }
 
@@ -626,6 +635,7 @@ mod tests {
             project: project.to_string(),
             timestamp: ts,
             source: "conversation".to_string(),
+            agent: AgentKind::ClaudeCode,
             kind,
             message_uuid: None,
             session_id: None,
@@ -717,7 +727,7 @@ mod tests {
         assert_eq!(out.prompt_count, 3);
         assert_eq!(out.folder_count, 2);
         assert_eq!(out.day_count, 2);
-        assert!(out.markdown.contains("# Claude Code Prompt 导出"));
+        assert!(out.markdown.contains("# Prompt 导出"));
         assert!(out.markdown.contains("你好，自我介绍一下"));
         assert!(
             !out.markdown.contains("范围外不应出现"),
@@ -776,7 +786,7 @@ mod tests {
             &prompts,
             &params("2026-05-16", "2026-05-16", true, Lang::En),
         );
-        assert!(out.markdown.contains("# Claude Code Prompt Export"));
+        assert!(out.markdown.contains("# Prompt Export"));
         assert!(out.markdown.contains("Time range"));
         assert!(out.markdown.contains("prompts"));
         assert!(out.markdown.contains("command"));
@@ -807,6 +817,7 @@ mod tests {
         let detail = ConversationDetail {
             session_id: "sess-1".into(),
             project: "/p/alpha".into(),
+            agent: AgentKind::ClaudeCode,
             git_branch: Some("main".into()),
             started_at: day_start_ms("2026-05-16").unwrap(),
             ended_at: day_start_ms("2026-05-16").unwrap() + 60_000,
@@ -815,6 +826,8 @@ mod tests {
                 ChatMessage {
                     uuid: "u1".into(),
                     role: "user".into(),
+                    phase: None,
+                    call_id: None,
                     timestamp: day_start_ms("2026-05-16").unwrap(),
                     is_sidechain: false,
                     is_meta: false,
@@ -825,6 +838,8 @@ mod tests {
                 ChatMessage {
                     uuid: "a1".into(),
                     role: "assistant".into(),
+                    phase: None,
+                    call_id: None,
                     timestamp: day_start_ms("2026-05-16").unwrap() + 1_000,
                     is_sidechain: false,
                     is_meta: false,
@@ -848,6 +863,8 @@ mod tests {
                 ChatMessage {
                     uuid: "a2".into(),
                     role: "assistant".into(),
+                    phase: None,
+                    call_id: None,
                     timestamp: day_start_ms("2026-05-16").unwrap() + 2_000,
                     is_sidechain: false,
                     is_meta: false,
@@ -894,6 +911,7 @@ mod tests {
         let detail = ConversationDetail {
             session_id: "sess-meta".into(),
             project: "/p/alpha".into(),
+            agent: AgentKind::ClaudeCode,
             git_branch: None,
             started_at: day_start_ms("2026-05-16").unwrap(),
             ended_at: day_start_ms("2026-05-16").unwrap() + 1_000,
@@ -902,6 +920,8 @@ mod tests {
                 ChatMessage {
                     uuid: "u1".into(),
                     role: "user".into(),
+                    phase: None,
+                    call_id: None,
                     timestamp: day_start_ms("2026-05-16").unwrap(),
                     is_sidechain: false,
                     is_meta: false,
@@ -912,6 +932,8 @@ mod tests {
                 ChatMessage {
                     uuid: "m1".into(),
                     role: "user".into(),
+                    phase: None,
+                    call_id: None,
                     timestamp: day_start_ms("2026-05-16").unwrap() + 1_000,
                     is_sidechain: false,
                     is_meta: true,
@@ -949,6 +971,7 @@ mod tests {
         let detail = ConversationDetail {
             session_id: "sess-time".into(),
             project: "/p/alpha".into(),
+            agent: AgentKind::ClaudeCode,
             git_branch: None,
             started_at: day_start_ms("2026-05-16").unwrap(),
             ended_at: day_start_ms("2026-05-16").unwrap(),
@@ -956,6 +979,8 @@ mod tests {
             messages: vec![ChatMessage {
                 uuid: "u1".into(),
                 role: "user".into(),
+                phase: None,
+                call_id: None,
                 timestamp: day_start_ms("2026-05-16").unwrap(),
                 is_sidechain: false,
                 is_meta: false,

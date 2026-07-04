@@ -34,10 +34,17 @@ fn ensure_index(state: &AppState, app: &AppHandle) -> Result<(), String> {
     }
     let paths = resolve_data_paths(app)?;
     if !paths.history.exists() && !paths.projects.exists() {
+        if paths.codex_sessions.exists() {
+            cleanup_legacy_cache(app);
+            let cache = cache_file(app);
+            *guard = Some(indexer::load_or_build(&paths, cache.as_deref()));
+            return Ok(());
+        }
         return Err(format!(
-            "未找到数据源：{} 与 {} 均不存在。请在设置中检查数据目录配置。",
+            "未找到数据源：{}、{} 与 {} 均不存在。请在设置中检查数据目录配置。",
             paths.history.display(),
-            paths.projects.display()
+            paths.projects.display(),
+            paths.codex_sessions.display()
         ));
     }
     cleanup_legacy_cache(app);
@@ -188,8 +195,13 @@ pub fn get_conversation(
     app: AppHandle,
 ) -> Result<ConversationDetail, String> {
     let (file, project) = session_context(&state, &app, &session_id)?;
-    let mut detail = parser::parse_conversation_detail(Path::new(&file))
-        .ok_or_else(|| "对话文件解析失败".to_string())?;
+    let is_codex = session_id.starts_with("codex:");
+    let mut detail = if is_codex {
+        parser::parse_codex_conversation_detail(Path::new(&file))
+    } else {
+        parser::parse_conversation_detail(Path::new(&file))
+    }
+    .ok_or_else(|| "对话文件解析失败".to_string())?;
     if detail.project.is_empty() {
         if let Some(project) = project {
             detail.project = project;
@@ -236,14 +248,17 @@ fn settings_view(s: &SettingsInput, config_path: &Path) -> Result<SettingsView, 
         history_file: s.history_file.clone(),
         projects_dir: s.projects_dir.clone(),
         sessions_dir: s.sessions_dir.clone(),
+        codex_sessions_dir: s.codex_sessions_dir.clone(),
         config_path: config_path.to_string_lossy().to_string(),
         resolved: ResolvedPaths {
             history: paths.history.to_string_lossy().to_string(),
             projects: paths.projects.to_string_lossy().to_string(),
             sessions: paths.sessions.to_string_lossy().to_string(),
+            codex_sessions: paths.codex_sessions.to_string_lossy().to_string(),
             history_exists: paths.history.is_file(),
             projects_exists: paths.projects.is_dir(),
             sessions_exists: paths.sessions.is_dir(),
+            codex_sessions_exists: paths.codex_sessions.is_dir(),
         },
     })
 }
@@ -349,12 +364,7 @@ pub fn export_search_results(
     let lang = Lang::from_opt(lang.as_deref());
     let vis = visibility.unwrap_or_default();
     let data = read_index(&state, &app, |idx| {
-        let results = indexer::search(
-            &idx.prompts,
-            &query,
-            project_filter.as_deref(),
-            &vis,
-        );
+        let results = indexer::search(&idx.prompts, &query, project_filter.as_deref(), &vis);
         let items: Vec<&PromptEntry> = results.iter().map(|r| &r.entry).collect();
         export::build_search_export(&items, &query, project_filter.as_deref(), lang)
     })?;
@@ -411,8 +421,13 @@ pub fn export_conversation(
     app: AppHandle,
 ) -> Result<ConversationExportResult, String> {
     let (file, project) = session_context(&state, &app, &session_id)?;
-    let mut detail = parser::parse_conversation_detail(Path::new(&file))
-        .ok_or_else(|| "对话文件解析失败".to_string())?;
+    let is_codex = session_id.starts_with("codex:");
+    let mut detail = if is_codex {
+        parser::parse_codex_conversation_detail(Path::new(&file))
+    } else {
+        parser::parse_conversation_detail(Path::new(&file))
+    }
+    .ok_or_else(|| "对话文件解析失败".to_string())?;
     if detail.project.is_empty() {
         if let Some(project) = project {
             detail.project = project;

@@ -14,6 +14,7 @@ const EMPTY_FORM: SettingsInput = {
   historyFile: "",
   projectsDir: "",
   sessionsDir: "",
+  codexSessionsDir: "",
 };
 
 function ResolvedRow({
@@ -91,6 +92,7 @@ export function SettingsDialog({
         historyFile: data.historyFile,
         projectsDir: data.projectsDir,
         sessionsDir: data.sessionsDir,
+        codexSessionsDir: data.codexSessionsDir,
       });
     }
   }, [data]);
@@ -109,7 +111,8 @@ export function SettingsDialog({
       form.claudeDataDir !== data.claudeDataDir ||
       form.historyFile !== data.historyFile ||
       form.projectsDir !== data.projectsDir ||
-      form.sessionsDir !== data.sessionsDir
+      form.sessionsDir !== data.sessionsDir ||
+      form.codexSessionsDir !== data.codexSessionsDir
     );
   }, [form, data]);
 
@@ -207,6 +210,12 @@ export function SettingsDialog({
                     placeholder={t("overridePlaceholder")}
                     onChange={setField("sessionsDir")}
                   />
+                  <FormField
+                    label={t("codexSessionsDirLabel")}
+                    value={form.codexSessionsDir}
+                    placeholder={t("codexSessionsDirPlaceholder")}
+                    onChange={setField("codexSessionsDir")}
+                  />
                 </div>
               </details>
 
@@ -229,6 +238,11 @@ export function SettingsDialog({
                     label={t("sessionsDirShort")}
                     path={data.resolved.sessions}
                     exists={data.resolved.sessionsExists}
+                  />
+                  <ResolvedRow
+                    label={t("codexSessionsDirShort")}
+                    path={data.resolved.codexSessions}
+                    exists={data.resolved.codexSessionsExists}
                   />
                 </div>
               )}

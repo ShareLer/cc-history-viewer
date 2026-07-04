@@ -60,6 +60,8 @@ function TabButton({
 
 function SessionRow({ session }: { session: SessionSummary }) {
   const t = useT();
+  const agentLabel =
+    session.agent === "codex" ? t("agentCodex") : t("agentClaudeCode");
   return (
     <Link
       to={`/conversation/${session.sessionId}`}
@@ -69,6 +71,9 @@ function SessionRow({ session }: { session: SessionSummary }) {
         {session.title || t("untitledSession")}
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted">
+        <Badge tone={session.agent === "codex" ? "accent" : "muted"}>
+          {agentLabel}
+        </Badge>
         <span>{absoluteTime(session.startedAt)}</span>
         <span>
           {t("messagesCount", { count: formatNumber(session.messageCount) })}

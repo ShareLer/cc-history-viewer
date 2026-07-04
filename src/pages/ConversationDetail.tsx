@@ -40,6 +40,7 @@ type ViewOptions = {
   showTools: boolean;
   showSkills: boolean;
   showMeta: boolean;
+  showCodexCommentary: boolean;
 };
 
 type ExportOptions = {
@@ -84,7 +85,19 @@ function shouldExportBlock(block: ContentBlock, options: ExportOptions): boolean
   }
 }
 
-function isMessageVisible(msg: ChatMessage, options: ViewOptions): boolean {
+function isMessageVisible(
+  msg: ChatMessage,
+  options: ViewOptions,
+  agent: string
+): boolean {
+  if (
+    agent === "codex" &&
+    msg.role === "assistant" &&
+    msg.phase === "commentary" &&
+    !options.showCodexCommentary
+  ) {
+    return false;
+  }
   if (msg.isMeta && !options.showMeta) return false;
   if (msg.metaKind === "command" && !options.showTools) return false;
   if (msg.metaKind === "skill" && !options.showSkills) return false;
@@ -154,10 +167,12 @@ function BlockView({
 function MessageBubble({
   msg,
   blocks,
+  agentLabel,
   highlighted = false,
 }: {
   msg: ChatMessage;
   blocks: ContentBlock[];
+  agentLabel: string;
   highlighted?: boolean;
 }) {
   const t = useT();
@@ -174,7 +189,7 @@ function MessageBubble({
       ? t("skillBadge")
       : isSystem
         ? t("commandBadge")
-        : "Claude";
+        : agentLabel;
 
   return (
     <div
@@ -207,6 +222,12 @@ function MessageBubble({
           {roleLabel}
         </Badge>
         {msg.isSidechain && <Badge tone="muted">{t("sidechainBadge")}</Badge>}
+        {msg.phase === "commentary" && (
+          <Badge tone="outline">{t("codexCommentaryBadge")}</Badge>
+        )}
+        {msg.phase === "final_answer" && (
+          <Badge tone="muted">{t("codexFinalAnswerBadge")}</Badge>
+        )}
         <span className="text-[11px] text-muted">{absoluteTime(msg.timestamp)}</span>
       </div>
       <div className="space-y-2">
@@ -244,6 +265,7 @@ export function ConversationDetail() {
     showTools: false,
     showSkills: false,
     showMeta: false,
+    showCodexCommentary: false,
   });
 
   const [exportOpen, setExportOpen] = useState(false);
@@ -295,6 +317,7 @@ export function ConversationDetail() {
       showTools: viewOptions.showTools || exportOptions.includeTools,
       showSkills: viewOptions.showSkills || exportOptions.includeSkills,
       showMeta: viewOptions.showMeta || exportOptions.includeMeta,
+      showCodexCommentary: viewOptions.showCodexCommentary,
     };
   }, [exportOpen, exportOptions, viewOptions]);
 
@@ -310,7 +333,8 @@ export function ConversationDetail() {
       }))
       .filter(
         ({ msg, blocks }) =>
-          isMessageVisible(msg, effectiveViewOptions) && blocks.length > 0
+          isMessageVisible(msg, effectiveViewOptions, data.agent) &&
+          blocks.length > 0
       );
   }, [data, effectiveViewOptions]);
 
@@ -407,7 +431,8 @@ export function ConversationDetail() {
     }
   };
 
-  const resumeCommand = data
+  const agentLabel = data?.agent === "codex" ? t("agentCodex") : t("agentClaudeCode");
+  const resumeCommand = data && data.agent === "claudeCode"
     ? data.project
       ? `cd "${data.project}" && claude --resume ${data.sessionId}`
       : `claude --resume ${data.sessionId}`
@@ -445,19 +470,21 @@ export function ConversationDetail() {
                 {t("conversationDetailTitle")}
               </h1>
               <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => copy(resumeCommand)}
-                  title={resumeCommand}
-                >
-                  {copied ? (
-                    <Check size={13} className="text-success" />
-                  ) : (
-                    <Terminal size={13} />
-                  )}
-                  {copied ? t("copied") : t("copyResumeCommand")}
-                </Button>
+                {data.agent === "claudeCode" && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => copy(resumeCommand)}
+                    title={resumeCommand}
+                  >
+                    {copied ? (
+                      <Check size={13} className="text-success" />
+                    ) : (
+                      <Terminal size={13} />
+                    )}
+                    {copied ? t("copied") : t("copyResumeCommand")}
+                  </Button>
+                )}
                 <Button
                   variant="outline"
                   size="sm"
@@ -486,6 +513,22 @@ export function ConversationDetail() {
                 />
                 {t("showThinkingToggle")}
               </label>
+              {data.agent === "codex" && (
+                <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-foreground">
+                  <input
+                    type="checkbox"
+                    checked={viewOptions.showCodexCommentary}
+                    onChange={(e) =>
+                      setViewOptions((prev) => ({
+                        ...prev,
+                        showCodexCommentary: e.target.checked,
+                      }))
+                    }
+                    className="accent-[var(--accent)]"
+                  />
+                  {t("showCodexCommentaryToggle")}
+                </label>
+              )}
               <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-foreground">
                 <input
                   type="checkbox"
@@ -688,7 +731,14 @@ export function ConversationDetail() {
                   {data.gitBranch}
                 </span>
               )}
-              {data.version && <Badge tone="muted">CC {data.version}</Badge>}
+              <Badge tone={data.agent === "codex" ? "accent" : "muted"}>
+                {agentLabel}
+              </Badge>
+              {data.version && (
+                <Badge tone="muted">
+                  {agentLabel} {data.version}
+                </Badge>
+              )}
               <span>
                 {absoluteTime(data.startedAt)} ~ {absoluteTime(data.endedAt)}
               </span>
@@ -734,6 +784,7 @@ export function ConversationDetail() {
                       <MessageBubble
                         msg={msg}
                         blocks={blocks}
+                        agentLabel={agentLabel}
                         highlighted={highlightIdx === index}
                       />
                     </div>

@@ -17,8 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEDUP_WINDOW_MS: i64 = 5 * 60 * 1000;
 
 /// 缓存格式版本；结构或解析规则变化时递增，旧缓存自动失效
-/// （v7：prompt 分类加入 kind，索引与缓存需重建）
-const CACHE_VERSION: u32 = 7;
+/// （v8：加入 Codex sessions 与 agent 字段，索引与缓存需重建）
+const CACHE_VERSION: u32 = 8;
 
 /// 构建好的全量索引（仅驻留内存；磁盘缓存见 CacheV2）
 pub struct AppIndex {
@@ -100,7 +100,7 @@ fn history_cache_changed(cache: &CacheV2, history_path: &str, history_mtime: i64
 
 /// 增量构建：逐文件对比 mtime，仅重解析新增 / 变化的文件；其余复用缓存。
 pub fn load_or_build(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
-    let conv_files = collect_jsonl_files(&paths.projects);
+    let conv_files = collect_all_conversation_files(paths);
     let mut old = cache_path
         .and_then(read_cache_v2)
         .unwrap_or_else(CacheV2::empty);
@@ -117,15 +117,15 @@ pub fn load_or_build(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
 
     // 对话文件：mtime 一致 → 复用；新增 / 变化 → 待重解析
     let mut files: HashMap<String, FileCache> = HashMap::with_capacity(conv_files.len());
-    let mut to_parse: Vec<(String, i64, PathBuf)> = Vec::new();
-    for f in conv_files {
+    let mut to_parse: Vec<(String, i64, PathBuf, AgentKind)> = Vec::new();
+    for (f, agent) in conv_files {
         let key = f.to_string_lossy().to_string();
         let mtime = file_mtime_ms(&f);
         match old.files.remove(&key) {
             Some(fc) if fc.mtime == mtime => {
                 files.insert(key, fc);
             }
-            _ => to_parse.push((key, mtime, f)),
+            _ => to_parse.push((key, mtime, f, agent)),
         }
     }
     // old.files 中剩余条目对应磁盘已删除的文件，直接丢弃
@@ -158,14 +158,14 @@ pub fn load_or_build(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
 
 /// 强制全量重建：忽略缓存重解析全部文件，并写回最新 CacheV2。
 pub fn build_and_cache(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
-    let conv_files = collect_jsonl_files(&paths.projects);
+    let conv_files = collect_all_conversation_files(paths);
     let history_path = paths.history.to_string_lossy().to_string();
     let history_mtime = file_mtime_ms(&paths.history);
     let history_prompts = parser::parse_history(&paths.history);
 
-    let to_parse: Vec<(String, i64, PathBuf)> = conv_files
+    let to_parse: Vec<(String, i64, PathBuf, AgentKind)> = conv_files
         .into_iter()
-        .map(|f| (f.to_string_lossy().to_string(), file_mtime_ms(&f), f))
+        .map(|(f, agent)| (f.to_string_lossy().to_string(), file_mtime_ms(&f), f, agent))
         .collect();
     let reparsed_files = to_parse.len();
 
@@ -189,11 +189,17 @@ pub fn build_and_cache(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex
 }
 
 /// 并行解析一批对话文件；解析失败（不可读等）的文件直接丢弃，下次仍会重试。
-fn parse_files_par(items: Vec<(String, i64, PathBuf)>) -> Vec<(String, i64, ConvFileResult)> {
+fn parse_files_par(
+    items: Vec<(String, i64, PathBuf, AgentKind)>,
+) -> Vec<(String, i64, ConvFileResult)> {
     items
         .into_par_iter()
-        .filter_map(|(key, mtime, path)| {
-            parser::parse_conversation_file(&path).map(|conv| (key, mtime, conv))
+        .filter_map(|(key, mtime, path, agent)| {
+            let parsed = match agent {
+                AgentKind::ClaudeCode => parser::parse_conversation_file(&path),
+                AgentKind::Codex => parser::parse_codex_session_file(&path),
+            };
+            parsed.map(|conv| (key, mtime, conv))
         })
         .collect()
 }
@@ -302,20 +308,21 @@ fn merge_prompts(history: Vec<RawPrompt>, conv: &[ConvFileResult]) -> Vec<Prompt
         all.extend(cr.user_prompts.iter().cloned());
     }
 
-    // 按 (项目, 文本, kind) 分组，避免同文本但不同类型的记录互相吞并
-    let mut groups: HashMap<(String, String, PromptKind), Vec<RawPrompt>> = HashMap::new();
+    // 按 (工具, 项目, 文本, kind) 分组，避免跨工具或不同类型记录互相吞并
+    let mut groups: HashMap<(AgentKind, String, String, PromptKind), Vec<RawPrompt>> =
+        HashMap::new();
     for rp in all {
         if rp.text.is_empty() || rp.project.is_empty() {
             continue;
         }
         groups
-            .entry((rp.project.clone(), rp.text.clone(), rp.kind))
+            .entry((rp.agent, rp.project.clone(), rp.text.clone(), rp.kind))
             .or_default()
             .push(rp);
     }
 
     let mut entries: Vec<PromptEntry> = Vec::new();
-    for ((project, text, kind), mut items) in groups {
+    for ((agent, project, text, kind), mut items) in groups {
         items.sort_by_key(|r| r.timestamp);
         let mut used = vec![false; items.len()];
         let pairs = nearest_cross_source_pairs(&items);
@@ -333,7 +340,7 @@ fn merge_prompts(history: Vec<RawPrompt>, conv: &[ConvFileResult]) -> Vec<Prompt
                 members.push(items[j].clone());
             }
 
-            entries.push(make_prompt_entry(&project, &text, kind, &members));
+            entries.push(make_prompt_entry(agent, &project, &text, kind, &members));
         }
     }
 
@@ -367,6 +374,7 @@ fn nearest_cross_source_pairs(items: &[RawPrompt]) -> Vec<Option<usize>> {
 }
 
 fn make_prompt_entry(
+    agent: AgentKind,
     project: &str,
     text: &str,
     kind: PromptKind,
@@ -391,11 +399,12 @@ fn make_prompt_entry(
         .join("|");
 
     PromptEntry {
-        id: make_id(project, timestamp, text, kind, &origin_key),
+        id: make_id(agent, project, timestamp, text, kind, &origin_key),
         text: text.to_string(),
         project: project.to_string(),
         timestamp,
         source: source.to_string(),
+        agent,
         kind,
         message_uuid,
         session_id,
@@ -406,9 +415,17 @@ fn make_prompt_entry(
     }
 }
 
-fn make_id(project: &str, ts: i64, text: &str, kind: PromptKind, origin_key: &str) -> String {
+fn make_id(
+    agent: AgentKind,
+    project: &str,
+    ts: i64,
+    text: &str,
+    kind: PromptKind,
+    origin_key: &str,
+) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    agent.hash(&mut h);
     project.hash(&mut h);
     ts.hash(&mut h);
     text.hash(&mut h);
@@ -499,6 +516,7 @@ fn build_sessions(conv: &[ConvFileResult]) -> Vec<SessionSummary> {
         .map(|cr| SessionSummary {
             session_id: cr.session_id.clone(),
             project: cr.project.clone().unwrap_or_default(),
+            agent: cr.agent,
             // 直接用首条 user prompt（可为空串），空标题的兜底展示由前端负责
             title: cr.first_prompt.clone(),
             started_at: cr.started_at,
@@ -909,6 +927,21 @@ fn collect_jsonl_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn collect_all_conversation_files(paths: &DataPaths) -> Vec<(PathBuf, AgentKind)> {
+    let mut files = Vec::new();
+    files.extend(
+        collect_jsonl_files(&paths.projects)
+            .into_iter()
+            .map(|p| (p, AgentKind::ClaudeCode)),
+    );
+    files.extend(
+        collect_jsonl_files(&paths.codex_sessions)
+            .into_iter()
+            .map(|p| (p, AgentKind::Codex)),
+    );
+    files
+}
+
 fn file_mtime_ms(p: &Path) -> i64 {
     fs::metadata(p)
         .ok()
@@ -940,6 +973,7 @@ mod tests {
     ) -> RawPrompt {
         RawPrompt {
             text: text.to_string(),
+            agent: AgentKind::ClaudeCode,
             project: project.to_string(),
             timestamp: ts,
             kind,
@@ -970,6 +1004,7 @@ mod tests {
         ConvFileResult {
             path: PathBuf::from(format!("/tmp/{session}.jsonl")),
             session_id: session.to_string(),
+            agent: AgentKind::ClaudeCode,
             project: project.map(str::to_string),
             git_branch: None,
             version: None,
@@ -1001,6 +1036,7 @@ mod tests {
             project: "/p".to_string(),
             timestamp: 0,
             source: "history".to_string(),
+            agent: AgentKind::ClaudeCode,
             kind: PromptKind::Human,
             message_uuid: None,
             session_id: None,
@@ -1148,7 +1184,14 @@ mod tests {
         let conv = vec![cf(
             "s1",
             Some("/p/a"),
-            vec![rp("继续", "/p/a", t0 + 30_000, PromptKind::Command, false, Some("s1"))],
+            vec![rp(
+                "继续",
+                "/p/a",
+                t0 + 30_000,
+                PromptKind::Command,
+                false,
+                Some("s1"),
+            )],
             vec![],
         )];
         let entries = merge_prompts(history, &conv);

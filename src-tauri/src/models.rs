@@ -3,6 +3,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 会话来源工具。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentKind {
+    ClaudeCode,
+    Codex,
+}
+
 /// prompt / user-channel 记录的分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -73,6 +81,8 @@ pub struct PromptEntry {
     pub timestamp: i64,
     /// 来源："history" | "conversation" | "both"
     pub source: String,
+    /// 所属工具来源：Claude Code / Codex
+    pub agent: AgentKind,
     /// 记录分类
     pub kind: PromptKind,
     /// 对话文件里的 user 消息 uuid；用于从 prompt 精确跳转到对话消息
@@ -120,6 +130,7 @@ pub struct SearchResult {
 pub struct SessionSummary {
     pub session_id: String,
     pub project: String,
+    pub agent: AgentKind,
     /// 首条 user prompt（作为标题）
     pub title: String,
     pub started_at: i64,
@@ -134,6 +145,7 @@ pub struct SessionSummary {
 pub struct ConversationDetail {
     pub session_id: String,
     pub project: String,
+    pub agent: AgentKind,
     pub git_branch: Option<String>,
     pub started_at: i64,
     pub ended_at: i64,
@@ -148,6 +160,10 @@ pub struct ChatMessage {
     pub uuid: String,
     /// "user" | "assistant" | "system"
     pub role: String,
+    /// Codex assistant message phase: "commentary" | "final_answer" | null
+    pub phase: Option<String>,
+    /// Tool call identifier used to pair Codex tool call/result messages.
+    pub call_id: Option<String>,
     pub timestamp: i64,
     pub is_sidechain: bool,
     /// JSONL 顶层 isMeta：框架/工具注入的 user-channel 元信息，不是真实用户 prompt
@@ -270,6 +286,8 @@ pub struct SettingsInput {
     pub projects_dir: String,
     /// 可选：单独指定 sessions 目录
     pub sessions_dir: String,
+    /// 可选：单独指定 Codex sessions 目录
+    pub codex_sessions_dir: String,
 }
 
 /// 设置视图：原始配置串 + 实际使用的配置文件路径 + 解析后的数据源路径
@@ -280,6 +298,7 @@ pub struct SettingsView {
     pub history_file: String,
     pub projects_dir: String,
     pub sessions_dir: String,
+    pub codex_sessions_dir: String,
     /// 实际使用（或将写入）的配置文件路径
     pub config_path: String,
     pub resolved: ResolvedPaths,
@@ -292,9 +311,11 @@ pub struct ResolvedPaths {
     pub history: String,
     pub projects: String,
     pub sessions: String,
+    pub codex_sessions: String,
     pub history_exists: bool,
     pub projects_exists: bool,
     pub sessions_exists: bool,
+    pub codex_sessions_exists: bool,
 }
 
 // ----------------------------- Token 用量统计 -----------------------------
