@@ -143,6 +143,7 @@ export const zh = {
   sortNewest: "最新",
   sortOldest: "最早",
   sortLongest: "最长",
+  agentFilterAll: "全部",
   messagesCount: "{count} 条消息",
   untitledSession: "（无 user 消息）",
   noPromptsInFolder: "该文件夹下暂无 prompt",
@@ -150,6 +151,8 @@ export const zh = {
   noConversationsInFolder: "该文件夹下没有对话记录",
   noConversationsInFolderHint:
     "只有在 Claude Code 或 Codex 数据源下有对话文件的文件夹才会显示会话。",
+  noSessionsForAgentFilter: "当前筛选下没有会话",
+  noSessionsForAgentFilterHint: "切换到全部或另一个来源后再看。",
 
   /* ----------------------------- 对话详情 ConversationDetail ----------------------------- */
   conversationDetailTitle: "对话详情",

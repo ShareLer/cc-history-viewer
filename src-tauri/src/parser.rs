@@ -524,6 +524,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
             None => continue,
         };
         let role = msg.role.clone().unwrap_or_else(|| ltype.to_string());
+        let call_id = claude_tool_call_id(msg.content.as_ref());
         let blocks = content_to_blocks(msg.content.as_ref());
         if blocks.is_empty() {
             continue;
@@ -532,7 +533,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
             uuid: stable_uuid,
             role,
             phase: None,
-            call_id: None,
+            call_id,
             timestamp: ts.unwrap_or(0),
             is_sidechain: parsed.is_sidechain.unwrap_or(false),
             is_meta: parsed.is_meta.unwrap_or(false),
@@ -557,7 +558,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
         started_at,
         ended_at,
         version,
-        messages,
+        messages: group_tool_results(messages),
     })
 }
 
@@ -864,7 +865,7 @@ pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail
         started_at,
         ended_at,
         version: meta.version,
-        messages: group_codex_tool_results(messages),
+        messages: group_tool_results(messages),
     })
 }
 
@@ -912,7 +913,7 @@ fn looks_like_codex_compaction_summary(text: &str) -> bool {
         || trimmed.starts_with("- User asked:")
 }
 
-fn group_codex_tool_results(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+fn group_tool_results(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let call_ids: HashSet<String> = messages
         .iter()
         .filter(|msg| is_tool_call_message(msg))
@@ -963,6 +964,34 @@ fn is_tool_call_message(msg: &ChatMessage) -> bool {
 
 fn is_tool_result_message(msg: &ChatMessage) -> bool {
     msg.blocks.iter().any(|b| b.kind == "tool_result")
+}
+
+fn claude_tool_call_id(content: Option<&serde_json::Value>) -> Option<String> {
+    let arr = content?.as_array()?;
+    for block in arr {
+        match block.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "tool_use" => {
+                if let Some(id) = block
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(id.to_string());
+                }
+            }
+            "tool_result" => {
+                if let Some(id) = block
+                    .get("tool_use_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn message_text(msg: &ChatMessage) -> String {
@@ -2204,6 +2233,81 @@ mod tests {
             classify_conversation_prompt_kind(&line, line.content.as_ref().unwrap()),
             PromptKind::Command
         );
+    }
+
+    #[test]
+    fn parse_conversation_detail_groups_tool_results_after_matching_calls() {
+        let path = std::env::temp_dir().join(format!(
+            "cc_history_viewer_tool_grouping_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let jsonl = [
+            json!({
+                "type": "assistant",
+                "uuid": "call-a",
+                "timestamp": "2026-07-04T00:00:00.000Z",
+                "cwd": "/tmp/project",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "tool-a", "name": "Bash", "input": {"command": "pwd"}}]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "call-b",
+                "timestamp": "2026-07-04T00:00:01.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "tool-b", "name": "Bash", "input": {"command": "ls"}}]
+                }
+            }),
+            json!({
+                "type": "user",
+                "uuid": "result-a",
+                "timestamp": "2026-07-04T00:00:02.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "tool-a", "content": "/tmp/project"}]
+                }
+            }),
+            json!({
+                "type": "user",
+                "uuid": "result-b",
+                "timestamp": "2026-07-04T00:00:03.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "tool-b", "content": "src"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let detail = parse_conversation_detail(&path).expect("fixture 应能解析");
+        let tool_call_ids: Vec<Option<&str>> = detail
+            .messages
+            .iter()
+            .filter(|m| is_tool_call_message(m) || is_tool_result_message(m))
+            .map(|m| m.call_id.as_deref())
+            .collect();
+        assert_eq!(
+            tool_call_ids,
+            vec![
+                Some("tool-a"),
+                Some("tool-a"),
+                Some("tool-b"),
+                Some("tool-b")
+            ]
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

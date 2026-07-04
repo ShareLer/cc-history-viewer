@@ -17,8 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEDUP_WINDOW_MS: i64 = 5 * 60 * 1000;
 
 /// 缓存格式版本；结构或解析规则变化时递增，旧缓存自动失效
-/// （v8：加入 Codex sessions 与 agent 字段，索引与缓存需重建）
-const CACHE_VERSION: u32 = 8;
+/// （v9：Claude Code 子代理会话不再作为独立会话索引，索引与缓存需重建）
+const CACHE_VERSION: u32 = 9;
 
 /// 构建好的全量索引（仅驻留内存；磁盘缓存见 CacheV2）
 pub struct AppIndex {
@@ -927,11 +927,17 @@ fn collect_jsonl_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn is_claude_subagent_file(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new("subagents"))
+}
+
 fn collect_all_conversation_files(paths: &DataPaths) -> Vec<(PathBuf, AgentKind)> {
     let mut files = Vec::new();
     files.extend(
         collect_jsonl_files(&paths.projects)
             .into_iter()
+            .filter(|p| !is_claude_subagent_file(p))
             .map(|p| (p, AgentKind::ClaudeCode)),
     );
     files.extend(
@@ -1068,6 +1074,47 @@ mod tests {
             "/new/.claude/history.jsonl",
             123
         ));
+    }
+
+    #[test]
+    fn collect_all_conversation_files_skips_claude_subagents_only() {
+        let root = std::env::temp_dir().join(format!(
+            "cc_history_viewer_indexer_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let claude_project = root.join("claude").join("projects").join("project-a");
+        let codex_sessions = root.join("codex").join("sessions");
+        let subagents = claude_project.join("main-session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::create_dir_all(&codex_sessions).unwrap();
+
+        let main_file = claude_project.join("main-session.jsonl");
+        let subagent_file = subagents.join("agent-1.jsonl");
+        let codex_file = codex_sessions.join("rollout.jsonl");
+        std::fs::write(&main_file, "").unwrap();
+        std::fs::write(&subagent_file, "").unwrap();
+        std::fs::write(&codex_file, "").unwrap();
+
+        let paths = DataPaths {
+            history: root.join("history.jsonl"),
+            projects: root.join("claude").join("projects"),
+            sessions: root.join("claude").join("sessions"),
+            codex_sessions,
+        };
+        let files = collect_all_conversation_files(&paths);
+        assert!(files
+            .iter()
+            .any(|(p, agent)| *agent == AgentKind::ClaudeCode && p == &main_file));
+        assert!(files
+            .iter()
+            .any(|(p, agent)| *agent == AgentKind::Codex && p == &codex_file));
+        assert!(!files.iter().any(|(p, _)| p == &subagent_file));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---------- merge_prompts ----------

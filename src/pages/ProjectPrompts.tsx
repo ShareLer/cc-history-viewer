@@ -11,7 +11,7 @@ import { PromptList } from "@/components/PromptList";
 import { PromptVisibilityFilters } from "@/components/PromptVisibilityFilters";
 import { Badge, CenterMessage, Skeleton } from "@/components/ui";
 import { useT, type DictKey } from "@/i18n";
-import type { SessionSummary, SortMode } from "@/lib/types";
+import type { AgentKind, SessionSummary, SortMode } from "@/lib/types";
 import { absoluteTime, cn, formatNumber, pathBaseName } from "@/lib/utils";
 import { errMessage } from "@/lib/api";
 
@@ -19,6 +19,17 @@ const sortOptions: { value: SortMode; labelKey: DictKey }[] = [
   { value: "newest", labelKey: "sortNewest" },
   { value: "oldest", labelKey: "sortOldest" },
   { value: "longest", labelKey: "sortLongest" },
+];
+
+type SessionAgentFilter = "all" | AgentKind;
+
+const sessionAgentFilters: {
+  value: SessionAgentFilter;
+  labelKey: DictKey;
+}[] = [
+  { value: "all", labelKey: "agentFilterAll" },
+  { value: "claudeCode", labelKey: "agentClaudeCode" },
+  { value: "codex", labelKey: "agentCodex" },
 ];
 
 function ListSkeleton() {
@@ -99,6 +110,8 @@ export function ProjectPrompts() {
   const t = useT();
   const [sort, setSort] = useState<SortMode>("newest");
   const [tab, setTab] = useState<"prompts" | "sessions">("sessions");
+  const [sessionAgentFilter, setSessionAgentFilter] =
+    useState<SessionAgentFilter>("all");
 
   const projectsQ = useProjects();
   const info = projectsQ.data?.find((p) => p.path === projectPath);
@@ -112,6 +125,11 @@ export function ProjectPrompts() {
     () => (promptsQ.data ?? []).map((entry) => ({ entry })),
     [promptsQ.data]
   );
+  const filteredSessions = useMemo(() => {
+    const sessions = sessionsQ.data ?? [];
+    if (sessionAgentFilter === "all") return sessions;
+    return sessions.filter((session) => session.agent === sessionAgentFilter);
+  }, [sessionAgentFilter, sessionsQ.data]);
 
   return (
     <div className="mx-auto max-w-4xl px-6 py-6">
@@ -182,6 +200,24 @@ export function ProjectPrompts() {
             ))}
           </div>
         )}
+        {tab === "sessions" && (
+          <div className="flex items-center gap-1 rounded-lg border border-border bg-surface p-0.5">
+            {sessionAgentFilters.map((o) => (
+              <button
+                key={o.value}
+                onClick={() => setSessionAgentFilter(o.value)}
+                className={cn(
+                  "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+                  sessionAgentFilter === o.value
+                    ? "bg-accent text-accent-fg"
+                    : "text-muted hover:text-foreground"
+                )}
+              >
+                {t(o.labelKey)}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       {tab === "prompts" ? (
@@ -214,11 +250,19 @@ export function ProjectPrompts() {
           hint={errMessage(sessionsQ.error)}
         />
       ) : sessionsQ.data && sessionsQ.data.length > 0 ? (
-        <div className="space-y-2.5">
-          {sessionsQ.data.map((s) => (
-            <SessionRow key={s.sessionId} session={s} />
-          ))}
-        </div>
+        filteredSessions.length > 0 ? (
+          <div className="space-y-2.5">
+            {filteredSessions.map((s) => (
+              <SessionRow key={s.sessionId} session={s} />
+            ))}
+          </div>
+        ) : (
+          <CenterMessage
+            icon={<MessagesSquare size={28} />}
+            title={t("noSessionsForAgentFilter")}
+            hint={t("noSessionsForAgentFilterHint")}
+          />
+        )
       ) : (
         <CenterMessage
           icon={<MessagesSquare size={28} />}

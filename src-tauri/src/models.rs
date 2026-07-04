@@ -162,7 +162,7 @@ pub struct ChatMessage {
     pub role: String,
     /// Codex assistant message phase: "commentary" | "final_answer" | null
     pub phase: Option<String>,
-    /// Tool call identifier used to pair Codex tool call/result messages.
+    /// Tool call identifier used to pair tool call/result messages.
     pub call_id: Option<String>,
     pub timestamp: i64,
     pub is_sidechain: bool,

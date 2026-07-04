@@ -146,6 +146,7 @@ export const en: Record<keyof typeof zh, string> = {
   sortNewest: "Newest",
   sortOldest: "Oldest",
   sortLongest: "Longest",
+  agentFilterAll: "All",
   messagesCount: "{count} messages",
   untitledSession: "(no user messages)",
   noPromptsInFolder: "No prompts in this folder",
@@ -153,6 +154,8 @@ export const en: Record<keyof typeof zh, string> = {
   noConversationsInFolder: "No conversations in this folder",
   noConversationsInFolderHint:
     "Sessions appear only for folders with conversation files in Claude Code or Codex data sources.",
+  noSessionsForAgentFilter: "No sessions for this filter",
+  noSessionsForAgentFilterHint: "Switch to All or another source.",
 
   /* ----------------------------- 对话详情 ConversationDetail ----------------------------- */
   conversationDetailTitle: "Conversation",
