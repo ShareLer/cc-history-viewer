@@ -4,9 +4,7 @@ use crate::export::{self, ExportParams, Lang};
 use crate::indexer::{self, AppIndex};
 use crate::models::*;
 use crate::parser;
-use crate::state::{
-    self, load_settings, resolve_data_paths, resolve_from_settings, AppState,
-};
+use crate::state::{self, load_settings, resolve_data_paths, resolve_from_settings, AppState};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
 
@@ -81,17 +79,17 @@ pub fn get_projects(
 pub fn get_project_prompts(
     project: String,
     sort: Option<String>,
-    include_commands: Option<bool>,
+    visibility: Option<PromptVisibility>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<Vec<PromptEntry>, String> {
-    let inc = include_commands.unwrap_or(true);
+    let vis = visibility.unwrap_or_default();
     read_index(&state, &app, |idx| {
         let mut v: Vec<PromptEntry> = idx
             .prompts
             .iter()
             .filter(|p| p.project == project)
-            .filter(|p| inc || !p.is_command)
+            .filter(|p| vis.allows(p.kind))
             .cloned()
             .collect();
         sort_prompts(&mut v, sort.as_deref());
@@ -103,16 +101,16 @@ pub fn get_project_prompts(
 #[tauri::command]
 pub fn get_recent_prompts(
     limit: Option<usize>,
-    include_commands: Option<bool>,
+    visibility: Option<PromptVisibility>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<Vec<PromptEntry>, String> {
     let lim = limit.unwrap_or(30);
-    let inc = include_commands.unwrap_or(true);
+    let vis = visibility.unwrap_or_default();
     read_index(&state, &app, |idx| {
         idx.prompts
             .iter()
-            .filter(|p| inc || !p.is_command)
+            .filter(|p| vis.allows(p.kind))
             .take(lim)
             .cloned()
             .collect()
@@ -124,13 +122,13 @@ pub fn get_recent_prompts(
 pub fn search_prompts(
     query: String,
     project_filter: Option<String>,
-    include_commands: Option<bool>,
+    visibility: Option<PromptVisibility>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<Vec<SearchResult>, String> {
-    let inc = include_commands.unwrap_or(true);
+    let vis = visibility.unwrap_or_default();
     read_index(&state, &app, |idx| {
-        indexer::search(&idx.prompts, &query, project_filter.as_deref(), inc)
+        indexer::search(&idx.prompts, &query, project_filter.as_deref(), &vis)
     })
 }
 
@@ -159,15 +157,27 @@ pub fn get_project_sessions(
     })
 }
 
-/// 按 sessionId 找到对话文件路径
-fn session_file(state: &AppState, app: &AppHandle, session_id: &str) -> Result<String, String> {
+/// 按 sessionId 找到对话文件路径与索引阶段解析出的项目路径。
+fn session_context(
+    state: &AppState,
+    app: &AppHandle,
+    session_id: &str,
+) -> Result<(String, Option<String>), String> {
     ensure_index(state, app)?;
     let guard = state.index.lock().map_err(|e| e.to_string())?;
     let idx = guard.as_ref().ok_or("索引尚未就绪")?;
-    idx.session_files
+    let file = idx
+        .session_files
         .get(session_id)
         .cloned()
-        .ok_or_else(|| format!("找不到会话文件：{session_id}"))
+        .ok_or_else(|| format!("找不到会话文件：{session_id}"))?;
+    let project = idx
+        .sessions
+        .iter()
+        .find(|s| s.session_id == session_id)
+        .map(|s| s.project.clone())
+        .filter(|p| !p.is_empty());
+    Ok((file, project))
 }
 
 /// 单个会话的完整对话详情
@@ -177,17 +187,20 @@ pub fn get_conversation(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<ConversationDetail, String> {
-    let file = session_file(&state, &app, &session_id)?;
-    parser::parse_conversation_detail(Path::new(&file))
-        .ok_or_else(|| "对话文件解析失败".to_string())
+    let (file, project) = session_context(&state, &app, &session_id)?;
+    let mut detail = parser::parse_conversation_detail(Path::new(&file))
+        .ok_or_else(|| "对话文件解析失败".to_string())?;
+    if detail.project.is_empty() {
+        if let Some(project) = project {
+            detail.project = project;
+        }
+    }
+    Ok(detail)
 }
 
 /// 索引元信息
 #[tauri::command]
-pub fn get_index_meta(
-    state: State<'_, AppState>,
-    app: AppHandle,
-) -> Result<IndexMeta, String> {
+pub fn get_index_meta(state: State<'_, AppState>, app: AppHandle) -> Result<IndexMeta, String> {
     read_index(&state, &app, |idx| IndexMeta {
         built_at: idx.built_at,
         from_cache: idx.from_cache,
@@ -198,10 +211,7 @@ pub fn get_index_meta(
 
 /// 强制重建索引（忽略缓存全量重解析）
 #[tauri::command]
-pub fn refresh_index(
-    state: State<'_, AppState>,
-    app: AppHandle,
-) -> Result<IndexMeta, String> {
+pub fn refresh_index(state: State<'_, AppState>, app: AppHandle) -> Result<IndexMeta, String> {
     let paths = resolve_data_paths(&app)?;
     let cache = cache_file(&app);
     let idx = indexer::build_and_cache(&paths, cache.as_deref());
@@ -270,7 +280,7 @@ pub fn build_prompt_export(
     start_date: String,
     end_date: String,
     project: Option<String>,
-    include_commands: bool,
+    visibility: Option<PromptVisibility>,
     group_by: Option<String>,
     write: bool,
     lang: Option<String>,
@@ -286,6 +296,7 @@ pub fn build_prompt_export(
     }
     let group = group_by.unwrap_or_else(|| "project".to_string());
     let lang = Lang::from_opt(lang.as_deref());
+    let vis = visibility.unwrap_or_default();
 
     let data = read_index(&state, &app, |idx| {
         export::build(
@@ -294,7 +305,7 @@ pub fn build_prompt_export(
                 start_ms,
                 end_ms,
                 project: project.as_deref(),
-                include_commands,
+                visibility: vis,
                 group_by: &group,
                 start_date: &start_date,
                 end_date: &end_date,
@@ -329,19 +340,20 @@ pub fn build_prompt_export(
 pub fn export_search_results(
     query: String,
     project_filter: Option<String>,
-    include_commands: bool,
+    visibility: Option<PromptVisibility>,
     write: bool,
     lang: Option<String>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<ExportResult, String> {
     let lang = Lang::from_opt(lang.as_deref());
+    let vis = visibility.unwrap_or_default();
     let data = read_index(&state, &app, |idx| {
         let results = indexer::search(
             &idx.prompts,
             &query,
             project_filter.as_deref(),
-            include_commands,
+            &vis,
         );
         let items: Vec<&PromptEntry> = results.iter().map(|r| &r.entry).collect();
         export::build_search_export(&items, &query, project_filter.as_deref(), lang)
@@ -398,9 +410,14 @@ pub fn export_conversation(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<ConversationExportResult, String> {
-    let file = session_file(&state, &app, &session_id)?;
-    let detail = parser::parse_conversation_detail(Path::new(&file))
+    let (file, project) = session_context(&state, &app, &session_id)?;
+    let mut detail = parser::parse_conversation_detail(Path::new(&file))
         .ok_or_else(|| "对话文件解析失败".to_string())?;
+    if detail.project.is_empty() {
+        if let Some(project) = project {
+            detail.project = project;
+        }
+    }
     let lang = Lang::from_opt(lang.as_deref());
     let selected = (!message_uuids.is_empty()).then(|| {
         message_uuids

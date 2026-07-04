@@ -17,8 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEDUP_WINDOW_MS: i64 = 5 * 60 * 1000;
 
 /// 缓存格式版本；结构或解析规则变化时递增，旧缓存自动失效
-/// （v5：对话 prompt 索引跳过 isMeta=true 的框架注入 user 消息）
-const CACHE_VERSION: u32 = 5;
+/// （v7：prompt 分类加入 kind，索引与缓存需重建）
+const CACHE_VERSION: u32 = 7;
 
 /// 构建好的全量索引（仅驻留内存；磁盘缓存见 CacheV2）
 pub struct AppIndex {
@@ -43,6 +43,8 @@ pub struct AppIndex {
 #[derive(Serialize, Deserialize)]
 struct CacheV2 {
     version: u32,
+    /// history.jsonl 的绝对路径；切换数据源时即使 mtime 巧合相同也必须重解析
+    history_path: String,
     /// history.jsonl 的 mtime(ms)；不一致则重解析 history
     history_mtime: i64,
     history_prompts: Vec<RawPrompt>,
@@ -63,6 +65,7 @@ impl CacheV2 {
     fn empty() -> Self {
         Self {
             version: CACHE_VERSION,
+            history_path: String::new(),
             history_mtime: -1,
             history_prompts: Vec::new(),
             files: HashMap::new(),
@@ -89,6 +92,10 @@ fn write_cache_v2(cache_path: &Path, cache: &CacheV2) {
     }
 }
 
+fn history_cache_changed(cache: &CacheV2, history_path: &str, history_mtime: i64) -> bool {
+    cache.history_path != history_path || cache.history_mtime != history_mtime
+}
+
 // ----------------------------- 公共入口 -----------------------------
 
 /// 增量构建：逐文件对比 mtime，仅重解析新增 / 变化的文件；其余复用缓存。
@@ -99,8 +106,9 @@ pub fn load_or_build(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
         .unwrap_or_else(CacheV2::empty);
 
     // history.jsonl：mtime 一致则复用缓存的解析结果
+    let history_path = paths.history.to_string_lossy().to_string();
     let history_mtime = file_mtime_ms(&paths.history);
-    let history_changed = old.history_mtime != history_mtime;
+    let history_changed = history_cache_changed(&old, &history_path, history_mtime);
     let history_prompts = if history_changed {
         parser::parse_history(&paths.history)
     } else {
@@ -133,6 +141,7 @@ pub fn load_or_build(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
 
     let cache = CacheV2 {
         version: CACHE_VERSION,
+        history_path,
         history_mtime,
         history_prompts,
         files,
@@ -150,6 +159,7 @@ pub fn load_or_build(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
 /// 强制全量重建：忽略缓存重解析全部文件，并写回最新 CacheV2。
 pub fn build_and_cache(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
     let conv_files = collect_jsonl_files(&paths.projects);
+    let history_path = paths.history.to_string_lossy().to_string();
     let history_mtime = file_mtime_ms(&paths.history);
     let history_prompts = parser::parse_history(&paths.history);
 
@@ -166,6 +176,7 @@ pub fn build_and_cache(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex
 
     let cache = CacheV2 {
         version: CACHE_VERSION,
+        history_path,
         history_mtime,
         history_prompts,
         files,
@@ -211,10 +222,7 @@ fn assemble_index(
     // 3. sessionId -> 文件路径
     let mut session_files = HashMap::new();
     for cr in &conv_results {
-        session_files.insert(
-            cr.session_id.clone(),
-            cr.path.to_string_lossy().to_string(),
-        );
+        session_files.insert(cr.session_id.clone(), cr.path.to_string_lossy().to_string());
     }
 
     // 4. 项目聚合
@@ -288,75 +296,44 @@ fn naive_decode(encoded: &str) -> String {
 
 // ----------------------------- prompt 合并去重 -----------------------------
 
-fn is_command(text: &str) -> bool {
-    text.starts_with('/')
-}
-
 fn merge_prompts(history: Vec<RawPrompt>, conv: &[ConvFileResult]) -> Vec<PromptEntry> {
     let mut all: Vec<RawPrompt> = history;
     for cr in conv {
         all.extend(cr.user_prompts.iter().cloned());
     }
 
-    // 按 (项目, 文本) 分组
-    let mut groups: HashMap<(String, String), Vec<RawPrompt>> = HashMap::new();
+    // 按 (项目, 文本, kind) 分组，避免同文本但不同类型的记录互相吞并
+    let mut groups: HashMap<(String, String, PromptKind), Vec<RawPrompt>> = HashMap::new();
     for rp in all {
         if rp.text.is_empty() || rp.project.is_empty() {
             continue;
         }
         groups
-            .entry((rp.project.clone(), rp.text.clone()))
+            .entry((rp.project.clone(), rp.text.clone(), rp.kind))
             .or_default()
             .push(rp);
     }
 
     let mut entries: Vec<PromptEntry> = Vec::new();
-    for ((project, text), mut items) in groups {
+    for ((project, text, kind), mut items) in groups {
         items.sort_by_key(|r| r.timestamp);
-        let mut i = 0;
-        while i < items.len() {
-            let base_ts = items[i].timestamp;
-            let mut j = i;
-            let mut has_history = false;
-            let mut has_conv = false;
-            let mut session_id: Option<String> = None;
-            let mut git_branch: Option<String> = None;
-            let mut pasted = 0usize;
-            // 把时间相近的同文本条目聚成一条
-            while j < items.len() && items[j].timestamp - base_ts <= DEDUP_WINDOW_MS {
-                let it = &items[j];
-                if it.from_history {
-                    has_history = true;
-                } else {
-                    has_conv = true;
-                }
-                if session_id.is_none() {
-                    session_id = it.session_id.clone();
-                }
-                if git_branch.is_none() {
-                    git_branch = it.git_branch.clone();
-                }
-                pasted = pasted.max(it.pasted_count);
-                j += 1;
+        let mut used = vec![false; items.len()];
+        let pairs = nearest_cross_source_pairs(&items);
+        for i in 0..items.len() {
+            if used[i] {
+                continue;
             }
-            let source = match (has_history, has_conv) {
-                (true, true) => "both",
-                (true, false) => "history",
-                _ => "conversation",
-            };
-            entries.push(PromptEntry {
-                id: make_id(&project, base_ts, &text),
-                text: text.clone(),
-                project: project.clone(),
-                timestamp: base_ts,
-                source: source.to_string(),
-                session_id,
-                git_branch,
-                is_command: is_command(&text),
-                pasted_count: pasted,
-                char_count: text.chars().count(),
-            });
-            i = j;
+            used[i] = true;
+            let mut members = vec![items[i].clone()];
+
+            // 只把 history 与 conversation 的同一条输入配成 source=both。
+            // 同来源的短时间重复输入是用户真实行为，必须保留为多条。
+            if let Some(j) = pairs[i] {
+                used[j] = true;
+                members.push(items[j].clone());
+            }
+
+            entries.push(make_prompt_entry(&project, &text, kind, &members));
         }
     }
 
@@ -364,20 +341,87 @@ fn merge_prompts(history: Vec<RawPrompt>, conv: &[ConvFileResult]) -> Vec<Prompt
     entries
 }
 
-fn make_id(project: &str, ts: i64, text: &str) -> String {
+fn nearest_cross_source_pairs(items: &[RawPrompt]) -> Vec<Option<usize>> {
+    let mut candidates: Vec<(u64, i64, usize, usize)> = Vec::new();
+    for i in 0..items.len() {
+        for j in (i + 1)..items.len() {
+            if items[i].from_history == items[j].from_history {
+                continue;
+            }
+            let diff = items[i].timestamp.abs_diff(items[j].timestamp);
+            if diff <= DEDUP_WINDOW_MS as u64 {
+                candidates.push((diff, items[i].timestamp.min(items[j].timestamp), i, j));
+            }
+        }
+    }
+    candidates.sort_unstable();
+
+    let mut pairs = vec![None; items.len()];
+    for (_, _, i, j) in candidates {
+        if pairs[i].is_none() && pairs[j].is_none() {
+            pairs[i] = Some(j);
+            pairs[j] = Some(i);
+        }
+    }
+    pairs
+}
+
+fn make_prompt_entry(
+    project: &str,
+    text: &str,
+    kind: PromptKind,
+    members: &[RawPrompt],
+) -> PromptEntry {
+    let timestamp = members.iter().map(|m| m.timestamp).min().unwrap_or(0);
+    let has_history = members.iter().any(|m| m.from_history);
+    let has_conv = members.iter().any(|m| !m.from_history);
+    let source = match (has_history, has_conv) {
+        (true, true) => "both",
+        (true, false) => "history",
+        _ => "conversation",
+    };
+    let session_id = members.iter().find_map(|m| m.session_id.clone());
+    let message_uuid = members.iter().find_map(|m| m.message_uuid.clone());
+    let git_branch = members.iter().find_map(|m| m.git_branch.clone());
+    let pasted_count = members.iter().map(|m| m.pasted_count).max().unwrap_or(0);
+    let origin_key = members
+        .iter()
+        .map(|m| m.origin_key.as_str())
+        .collect::<Vec<_>>()
+        .join("|");
+
+    PromptEntry {
+        id: make_id(project, timestamp, text, kind, &origin_key),
+        text: text.to_string(),
+        project: project.to_string(),
+        timestamp,
+        source: source.to_string(),
+        kind,
+        message_uuid,
+        session_id,
+        git_branch,
+        is_command: kind == PromptKind::Command,
+        pasted_count,
+        char_count: text.chars().count(),
+    }
+}
+
+fn make_id(project: &str, ts: i64, text: &str, kind: PromptKind, origin_key: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     project.hash(&mut h);
     ts.hash(&mut h);
     text.hash(&mut h);
+    kind.hash(&mut h);
+    origin_key.hash(&mut h);
     format!("{:016x}", h.finish())
 }
 
 // ----------------------------- 项目 / 会话聚合 -----------------------------
 
 fn project_name(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    match trimmed.rsplit('/').next() {
+    let trimmed = path.trim_end_matches(|c| c == '/' || c == '\\');
+    match trimmed.rsplit(|c| c == '/' || c == '\\').next() {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => path.to_string(),
     }
@@ -400,7 +444,7 @@ fn aggregate_projects(prompts: &[PromptEntry], conv: &[ConvFileResult]) -> Vec<P
             has_conversations: false,
         });
         info.prompt_count += 1;
-        if p.is_command {
+        if p.kind == PromptKind::Command {
             info.command_count += 1;
         }
         if p.timestamp < info.first_active {
@@ -495,7 +539,7 @@ fn compute_stats(
             }
             _ => {}
         }
-        if p.is_command {
+        if p.kind == PromptKind::Command {
             command_count += 1;
         }
         if p.timestamp < first_use {
@@ -763,7 +807,7 @@ pub fn search(
     prompts: &[PromptEntry],
     query: &str,
     project_filter: Option<&str>,
-    include_commands: bool,
+    visibility: &PromptVisibility,
 ) -> Vec<SearchResult> {
     let tokens: Vec<Vec<char>> = query
         .split_whitespace()
@@ -781,7 +825,7 @@ pub fn search(
                 continue;
             }
         }
-        if !include_commands && p.is_command {
+        if !visibility.allows(p.kind) {
             continue;
         }
         let lower: Vec<char> = p.text.chars().map(fold_char).collect();
@@ -890,6 +934,7 @@ mod tests {
         text: &str,
         project: &str,
         ts: i64,
+        kind: PromptKind,
         from_history: bool,
         session: Option<&str>,
     ) -> RawPrompt {
@@ -897,6 +942,18 @@ mod tests {
             text: text.to_string(),
             project: project.to_string(),
             timestamp: ts,
+            kind,
+            origin_key: format!(
+                "{}:{}:{}",
+                if from_history {
+                    "history"
+                } else {
+                    "conversation"
+                },
+                session.unwrap_or("none"),
+                ts
+            ),
+            message_uuid: (!from_history).then(|| format!("msg-{ts}")),
             session_id: session.map(str::to_string),
             git_branch: None,
             pasted_count: 0,
@@ -944,6 +1001,8 @@ mod tests {
             project: "/p".to_string(),
             timestamp: 0,
             source: "history".to_string(),
+            kind: PromptKind::Human,
+            message_uuid: None,
             session_id: None,
             git_branch: None,
             is_command: false,
@@ -952,29 +1011,106 @@ mod tests {
         }
     }
 
+    // ---------- CacheV2 ----------
+
+    #[test]
+    fn history_cache_invalidates_when_path_changes_even_if_mtime_matches() {
+        let cache = CacheV2 {
+            version: CACHE_VERSION,
+            history_path: "/old/.claude/history.jsonl".to_string(),
+            history_mtime: 123,
+            history_prompts: Vec::new(),
+            files: HashMap::new(),
+        };
+        assert!(!history_cache_changed(
+            &cache,
+            "/old/.claude/history.jsonl",
+            123
+        ));
+        assert!(history_cache_changed(
+            &cache,
+            "/new/.claude/history.jsonl",
+            123
+        ));
+    }
+
     // ---------- merge_prompts ----------
 
     #[test]
     fn merge_same_text_within_window_becomes_both() {
         let t0 = 1_700_000_000_000i64;
-        let history = vec![rp("跑测试", "/p/a", t0, true, None)];
+        let history = vec![rp("跑测试", "/p/a", t0, PromptKind::Human, true, None)];
         let conv = vec![cf(
             "s1",
             Some("/p/a"),
-            vec![rp("跑测试", "/p/a", t0 + 60_000, false, Some("s1"))],
+            vec![rp(
+                "跑测试",
+                "/p/a",
+                t0 + 60_000,
+                PromptKind::Human,
+                false,
+                Some("s1"),
+            )],
             vec![],
         )];
         let entries = merge_prompts(history, &conv);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].source, "both");
         assert_eq!(entries[0].session_id.as_deref(), Some("s1"));
+        assert_eq!(
+            entries[0].message_uuid.as_deref(),
+            Some(format!("msg-{}", t0 + 60_000).as_str())
+        );
         assert!(!entries[0].is_command);
+    }
+
+    #[test]
+    fn merge_keeps_same_source_repeated_prompts_within_window() {
+        let t0 = 1_700_000_000_000i64;
+        let history = vec![
+            rp("继续", "/p/a", t0, PromptKind::Human, true, None),
+            rp("继续", "/p/a", t0 + 30_000, PromptKind::Human, true, None),
+        ];
+        let entries = merge_prompts(history, &[]);
+        assert_eq!(entries.len(), 2, "同来源重复输入不能被去重吞掉");
+        assert!(entries.iter().all(|e| e.source == "history"));
+        assert_ne!(entries[0].id, entries[1].id);
+    }
+
+    #[test]
+    fn merge_pairs_nearest_cross_source_prompt_globally() {
+        let t0 = 1_700_000_000_000i64;
+        let history = vec![
+            rp("继续", "/p/a", t0, PromptKind::Human, true, None),
+            rp("继续", "/p/a", t0 + 240_000, PromptKind::Human, true, None),
+        ];
+        let conv = vec![cf(
+            "s1",
+            Some("/p/a"),
+            vec![rp(
+                "继续",
+                "/p/a",
+                t0 + 241_000,
+                PromptKind::Human,
+                false,
+                Some("s1"),
+            )],
+            vec![],
+        )];
+        let entries = merge_prompts(history, &conv);
+        assert_eq!(entries.len(), 2);
+        let both = entries.iter().find(|e| e.source == "both").unwrap();
+        assert_eq!(both.timestamp, t0 + 240_000);
+        assert_eq!(
+            both.message_uuid.as_deref(),
+            Some(format!("msg-{}", t0 + 241_000).as_str())
+        );
     }
 
     #[test]
     fn merge_same_text_beyond_window_stays_separate() {
         let t0 = 1_700_000_000_000i64;
-        let history = vec![rp("跑测试", "/p/a", t0, true, None)];
+        let history = vec![rp("跑测试", "/p/a", t0, PromptKind::Human, true, None)];
         let conv = vec![cf(
             "s1",
             Some("/p/a"),
@@ -982,6 +1118,7 @@ mod tests {
                 "跑测试",
                 "/p/a",
                 t0 + DEDUP_WINDOW_MS + 1,
+                PromptKind::Human,
                 false,
                 Some("s1"),
             )],
@@ -997,11 +1134,28 @@ mod tests {
     #[test]
     fn merge_detects_command() {
         let entries = merge_prompts(
-            vec![rp("/clear", "/p/a", 1_000, true, None)],
+            vec![rp("/clear", "/p/a", 1_000, PromptKind::Command, true, None)],
             &[],
         );
         assert_eq!(entries.len(), 1);
         assert!(entries[0].is_command);
+    }
+
+    #[test]
+    fn merge_keeps_human_and_command_same_text_separate() {
+        let t0 = 1_700_000_000_000i64;
+        let history = vec![rp("继续", "/p/a", t0, PromptKind::Human, true, None)];
+        let conv = vec![cf(
+            "s1",
+            Some("/p/a"),
+            vec![rp("继续", "/p/a", t0 + 30_000, PromptKind::Command, false, Some("s1"))],
+            vec![],
+        )];
+        let entries = merge_prompts(history, &conv);
+        assert_eq!(entries.len(), 2, "不同 kind 的同文本记录不应互相合并");
+        let kinds: HashSet<PromptKind> = entries.iter().map(|e| e.kind).collect();
+        assert!(kinds.contains(&PromptKind::Human));
+        assert!(kinds.contains(&PromptKind::Command));
     }
 
     // ---------- search ----------
@@ -1009,7 +1163,7 @@ mod tests {
     #[test]
     fn search_multi_keyword_and() {
         let prompts = vec![pe("foo something bar"), pe("foo only")];
-        let r = search(&prompts, "foo bar", None, true);
+        let r = search(&prompts, "foo bar", None, &PromptVisibility::default());
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].entry.text, "foo something bar");
     }
@@ -1017,7 +1171,7 @@ mod tests {
     #[test]
     fn search_case_insensitive_non_ascii() {
         let prompts = vec![pe("Grab a café latte")];
-        let r = search(&prompts, "CAFÉ", None, true);
+        let r = search(&prompts, "CAFÉ", None, &PromptVisibility::default());
         assert_eq!(r.len(), 1, "大写 É 应命中小写 é");
         // "café" 起于 char 索引 7（高亮区间按 char 索引计）
         assert_eq!(r[0].match_ranges, vec![[7, 11]]);
@@ -1026,7 +1180,7 @@ mod tests {
     #[test]
     fn search_merges_overlapping_ranges() {
         let prompts = vec![pe("abcdx")];
-        let r = search(&prompts, "abc bcd", None, true);
+        let r = search(&prompts, "abc bcd", None, &PromptVisibility::default());
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].match_ranges, vec![[0, 4]], "重叠区间应合并");
     }
@@ -1044,7 +1198,10 @@ mod tests {
     #[test]
     fn naive_decode_keeps_encoded_name_as_is() {
         // 含连字符的目录名不能被错误还原成路径分隔符
-        assert_eq!(naive_decode("-Users-xzl-my-project"), "-Users-xzl-my-project");
+        assert_eq!(
+            naive_decode("-Users-xzl-my-project"),
+            "-Users-xzl-my-project"
+        );
         assert_eq!(naive_decode(""), "");
     }
 

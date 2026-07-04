@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Languages, Layers, RefreshCw, Settings, Terminal } from "lucide-react";
@@ -57,6 +57,7 @@ export function Layout() {
   const location = useLocation();
   const t = useT();
   const { lang, setLang } = useLang();
+  const mainRef = useRef<HTMLElement>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
@@ -74,6 +75,10 @@ export function Layout() {
   }, [location.pathname, setCurrentProject, setScope]);
 
   const searching = query.trim().length > 0;
+
+  useLayoutEffect(() => {
+    mainRef.current?.scrollTo({ top: 0, left: 0 });
+  }, [location.pathname]);
 
   const handleRefresh = async () => {
     if (refreshing) return;
@@ -174,7 +179,7 @@ export function Layout() {
 
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />
-        <main className="flex-1 overflow-y-auto">
+        <main ref={mainRef} className="flex-1 overflow-y-auto">
           {searching ? (
             <SearchResults />
           ) : (

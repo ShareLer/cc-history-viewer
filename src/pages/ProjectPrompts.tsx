@@ -8,10 +8,11 @@ import {
   useProjects,
 } from "@/hooks/queries";
 import { PromptList } from "@/components/PromptList";
+import { PromptVisibilityFilters } from "@/components/PromptVisibilityFilters";
 import { Badge, CenterMessage, Skeleton } from "@/components/ui";
 import { useT, type DictKey } from "@/i18n";
 import type { SessionSummary, SortMode } from "@/lib/types";
-import { absoluteTime, cn, formatNumber } from "@/lib/utils";
+import { absoluteTime, cn, formatNumber, pathBaseName } from "@/lib/utils";
 import { errMessage } from "@/lib/api";
 
 const sortOptions: { value: SortMode; labelKey: DictKey }[] = [
@@ -86,17 +87,17 @@ function SessionRow({ session }: { session: SessionSummary }) {
 export function ProjectPrompts() {
   const params = useParams();
   const projectPath = params.encoded ?? "";
-  const name = projectPath.split("/").filter(Boolean).pop() || projectPath;
+  const name = pathBaseName(projectPath);
 
-  // 「当前文件夹」由 Layout 根据路由统一登记，这里只读 includeCommands
-  const { includeCommands } = useStore();
+  // 「当前文件夹」由 Layout 根据路由统一登记，这里只读 promptVisibility
+  const { promptVisibility } = useStore();
   const t = useT();
   const [sort, setSort] = useState<SortMode>("newest");
-  const [tab, setTab] = useState<"prompts" | "sessions">("prompts");
+  const [tab, setTab] = useState<"prompts" | "sessions">("sessions");
 
   const projectsQ = useProjects();
   const info = projectsQ.data?.find((p) => p.path === projectPath);
-  const promptsQ = useProjectPrompts(projectPath, sort, includeCommands);
+  const promptsQ = useProjectPrompts(projectPath, sort, promptVisibility);
   const sessionsQ = useProjectSessions(
     tab === "sessions" ? projectPath : null
   );
@@ -143,18 +144,18 @@ export function ProjectPrompts() {
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center rounded-lg border border-border bg-surface p-0.5">
           <TabButton
-            active={tab === "prompts"}
-            onClick={() => setTab("prompts")}
-            icon={<ListTree size={13} />}
-          >
-            {t("promptsTab")}
-          </TabButton>
-          <TabButton
             active={tab === "sessions"}
             onClick={() => setTab("sessions")}
             icon={<MessagesSquare size={13} />}
           >
             {t("sessionsTab")}
+          </TabButton>
+          <TabButton
+            active={tab === "prompts"}
+            onClick={() => setTab("prompts")}
+            icon={<ListTree size={13} />}
+          >
+            {t("promptsTab")}
           </TabButton>
         </div>
 
@@ -179,23 +180,26 @@ export function ProjectPrompts() {
       </div>
 
       {tab === "prompts" ? (
-        promptsQ.isLoading ? (
-          <ListSkeleton />
-        ) : promptsQ.isError ? (
-          <CenterMessage
-            icon={<Folder size={28} />}
-            title={t("loadFailed")}
-            hint={errMessage(promptsQ.error)}
-          />
-        ) : promptItems.length > 0 ? (
-          <PromptList items={promptItems} />
-        ) : (
-          <CenterMessage
-            icon={<Folder size={28} />}
-            title={t("noPromptsInFolder")}
-            hint={includeCommands ? undefined : t("noPromptsInFolderHint")}
-          />
-        )
+        <>
+          <PromptVisibilityFilters className="mb-3" />
+          {promptsQ.isLoading ? (
+            <ListSkeleton />
+          ) : promptsQ.isError ? (
+            <CenterMessage
+              icon={<Folder size={28} />}
+              title={t("loadFailed")}
+              hint={errMessage(promptsQ.error)}
+            />
+          ) : promptItems.length > 0 ? (
+            <PromptList items={promptItems} />
+          ) : (
+            <CenterMessage
+              icon={<Folder size={28} />}
+              title={t("noPromptsInFolder")}
+              hint={t("noPromptsInFolderHint")}
+            />
+          )}
+        </>
       ) : sessionsQ.isLoading ? (
         <ListSkeleton />
       ) : sessionsQ.isError ? (

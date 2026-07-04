@@ -2,7 +2,7 @@
 //! 不重新解析任何 JSONL —— 数据全部来自 indexer 产出的 PromptEntry / parser 产出的 ConversationDetail。
 //! 所有用户可见文案支持 zh / en（由 lang 参数控制，默认 zh）。
 
-use crate::models::{ChatMessage, ContentBlock, ConversationDetail, PromptEntry};
+use crate::models::{ChatMessage, ContentBlock, ConversationDetail, PromptEntry, PromptVisibility};
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use std::collections::{HashMap, HashSet};
 
@@ -49,7 +49,7 @@ pub struct ExportParams<'a> {
     pub start_ms: i64,
     pub end_ms: i64,
     pub project: Option<&'a str>,
-    pub include_commands: bool,
+    pub visibility: PromptVisibility,
     /// "project" | "day" | "none"
     pub group_by: &'a str,
     /// 展示用的日期范围（YYYY-MM-DD）
@@ -115,7 +115,7 @@ pub fn build(prompts: &[PromptEntry], p: &ExportParams) -> ExportData {
         .iter()
         .filter(|e| e.timestamp >= p.start_ms && e.timestamp <= p.end_ms)
         .filter(|e| p.project.map_or(true, |pf| e.project == pf))
-        .filter(|e| p.include_commands || !e.is_command)
+        .filter(|e| p.visibility.allows(e.kind))
         .collect();
     items.sort_by_key(|e| e.timestamp);
 
@@ -209,9 +209,7 @@ fn render_by_project(md: &mut String, items: &[&PromptEntry], lang: Lang) {
         let list = &groups[proj];
         md.push_str(&format!("## 📁 {}\n\n", project_name(proj)));
         match lang {
-            Lang::Zh => {
-                md.push_str(&format!("`{}` · {} 条\n\n", pretty_path(proj), list.len()))
-            }
+            Lang::Zh => md.push_str(&format!("`{}` · {} 条\n\n", pretty_path(proj), list.len())),
             Lang::En => md.push_str(&format!(
                 "`{}` · {} prompts\n\n",
                 pretty_path(proj),
@@ -328,7 +326,9 @@ pub fn build_search_export(
             md.push_str(&format!("> **关键词**　`{query}`\n"));
             md.push_str(&format!(
                 "> **范围**　{}\n",
-                scope.map(pretty_path).unwrap_or_else(|| "全部文件夹".to_string())
+                scope
+                    .map(pretty_path)
+                    .unwrap_or_else(|| "全部文件夹".to_string())
             ));
             md.push_str(&format!(
                 "> **共**　{prompt_count} 条 prompt · {folder_count} 个文件夹 · 跨 {day_count} 天\n"
@@ -340,7 +340,9 @@ pub fn build_search_export(
             md.push_str(&format!("> **Keyword**　`{query}`\n"));
             md.push_str(&format!(
                 "> **Scope**　{}\n",
-                scope.map(pretty_path).unwrap_or_else(|| "all folders".to_string())
+                scope
+                    .map(pretty_path)
+                    .unwrap_or_else(|| "all folders".to_string())
             ));
             md.push_str(&format!(
                 "> **Total**　{prompt_count} prompts · {folder_count} folders · across {day_count} days\n"
@@ -443,7 +445,11 @@ pub fn build_conversation_markdown(
         md.push_str(&format!("> **{}**　{}\n", label("分支", "Branch"), b));
     }
     if let Some(v) = detail.version.as_deref().filter(|v| !v.is_empty()) {
-        md.push_str(&format!("> **{}**　{}\n", label("CC 版本", "CC version"), v));
+        md.push_str(&format!(
+            "> **{}**　{}\n",
+            label("CC 版本", "CC version"),
+            v
+        ));
     }
     md.push_str(&format!(
         "> **{}**　{} ~ {}\n",
@@ -469,7 +475,12 @@ pub fn build_conversation_markdown(
 }
 
 /// 渲染单个内容块；不可见（未勾选工具）时不输出任何内容。
-fn render_block(md: &mut String, b: &ContentBlock, options: &ConversationExportOptions, lang: Lang) {
+fn render_block(
+    md: &mut String,
+    b: &ContentBlock,
+    options: &ConversationExportOptions,
+    lang: Lang,
+) {
     let label = |zh: &'static str, en: &'static str| match lang {
         Lang::Zh => zh,
         Lang::En => en,
@@ -488,10 +499,7 @@ fn render_block(md: &mut String, b: &ContentBlock, options: &ConversationExportO
             ));
         }
         "thinking" if options.include_thinking => {
-            md.push_str(&format!(
-                "**{}**\n\n",
-                label("💭 思考过程", "💭 Thinking")
-            ));
+            md.push_str(&format!("**{}**\n\n", label("💭 思考过程", "💭 Thinking")));
             if let Some(t) = b.text.as_deref() {
                 for line in t.trim().lines() {
                     md.push_str("> ");
@@ -516,15 +524,15 @@ fn render_block(md: &mut String, b: &ContentBlock, options: &ConversationExportO
             md.push_str(&format!("````json\n{input}\n````\n\n"));
         }
         "tool_result" if options.include_tools => {
-            md.push_str(&format!(
-                "**{}**\n\n",
-                label("↩ 工具结果", "↩ Tool result")
-            ));
+            md.push_str(&format!("**{}**\n\n", label("↩ 工具结果", "↩ Tool result")));
             let t = b.text.as_deref().unwrap_or("");
             md.push_str(&format!("````\n{}\n````\n\n", t.trim()));
         }
         "skill" if options.include_skills => {
-            md.push_str(&format!("**{}**\n\n", label("🧩 Skill 详情", "🧩 Skill details")));
+            md.push_str(&format!(
+                "**{}**\n\n",
+                label("🧩 Skill 详情", "🧩 Skill details")
+            ));
             if let Some(t) = b.text.as_deref().filter(|t| !t.trim().is_empty()) {
                 md.push_str(&format!("````\n{}\n````\n\n", t.trim()));
             }
@@ -588,8 +596,8 @@ fn now_label() -> String {
 
 /// 取路径末级目录名作为展示名。
 fn project_name(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    match trimmed.rsplit('/').next() {
+    let trimmed = path.trim_end_matches(|c| c == '/' || c == '\\');
+    match trimmed.rsplit(|c| c == '/' || c == '\\').next() {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => path.to_string(),
     }
@@ -611,18 +619,27 @@ mod tests {
     use super::*;
     use crate::models::ChatMessage;
 
-    fn mk(project: &str, ts: i64, text: &str, is_command: bool) -> PromptEntry {
+    fn mk(project: &str, ts: i64, text: &str, kind: crate::models::PromptKind) -> PromptEntry {
         PromptEntry {
             id: format!("{ts}"),
             text: text.to_string(),
             project: project.to_string(),
             timestamp: ts,
             source: "conversation".to_string(),
+            kind,
+            message_uuid: None,
             session_id: None,
             git_branch: None,
-            is_command,
+            is_command: kind == crate::models::PromptKind::Command,
             pasted_count: 0,
             char_count: text.chars().count(),
+        }
+    }
+
+    fn visibility(include_commands: bool) -> PromptVisibility {
+        PromptVisibility {
+            include_commands,
+            ..Default::default()
         }
     }
 
@@ -636,7 +653,7 @@ mod tests {
             start_ms: day_start_ms(start).unwrap(),
             end_ms: day_end_ms(end).unwrap(),
             project: None,
-            include_commands,
+            visibility: visibility(include_commands),
             group_by: "project",
             start_date: start,
             end_date: end,
@@ -660,21 +677,52 @@ mod tests {
         let d17 = day_start_ms("2026-05-17").unwrap();
         let d18 = day_start_ms("2026-05-18").unwrap();
         let prompts = vec![
-            mk("/p/alpha", d16 + 3_600_000, "你好，自我介绍一下", false),
-            mk("/p/alpha", d16 + 7_200_000, "抽出 parser", false),
-            mk("/p/beta", d17 + 1_000, "跑测试", false),
-            mk("/p/alpha", d18 + 1_000, "范围外不应出现", false), // 越界
-            mk("/p/alpha", d16 + 100, "/clear", true),            // 命令
+            mk(
+                "/p/alpha",
+                d16 + 3_600_000,
+                "你好，自我介绍一下",
+                crate::models::PromptKind::Human,
+            ),
+            mk(
+                "/p/alpha",
+                d16 + 7_200_000,
+                "抽出 parser",
+                crate::models::PromptKind::Human,
+            ),
+            mk(
+                "/p/beta",
+                d17 + 1_000,
+                "跑测试",
+                crate::models::PromptKind::Human,
+            ),
+            mk(
+                "/p/alpha",
+                d18 + 1_000,
+                "范围外不应出现",
+                crate::models::PromptKind::Human,
+            ), // 越界
+            mk(
+                "/p/alpha",
+                d16 + 100,
+                "/clear",
+                crate::models::PromptKind::Command,
+            ), // 命令
         ];
 
         // 默认不含命令
-        let out = build(&prompts, &params("2026-05-16", "2026-05-17", false, Lang::Zh));
+        let out = build(
+            &prompts,
+            &params("2026-05-16", "2026-05-17", false, Lang::Zh),
+        );
         assert_eq!(out.prompt_count, 3);
         assert_eq!(out.folder_count, 2);
         assert_eq!(out.day_count, 2);
         assert!(out.markdown.contains("# Claude Code Prompt 导出"));
         assert!(out.markdown.contains("你好，自我介绍一下"));
-        assert!(!out.markdown.contains("范围外不应出现"), "越界 prompt 不应导出");
+        assert!(
+            !out.markdown.contains("范围外不应出现"),
+            "越界 prompt 不应导出"
+        );
         assert!(!out.markdown.contains("/clear"), "默认不含命令");
         // alpha(2 条) 应排在 beta(1 条) 之前
         let ia = out.markdown.find("alpha").unwrap();
@@ -682,7 +730,10 @@ mod tests {
         assert!(ia < ib, "数量多的文件夹应在前");
 
         // 打开命令开关
-        let out2 = build(&prompts, &params("2026-05-16", "2026-05-17", true, Lang::Zh));
+        let out2 = build(
+            &prompts,
+            &params("2026-05-16", "2026-05-17", true, Lang::Zh),
+        );
         assert_eq!(out2.prompt_count, 4);
         assert!(out2.markdown.contains("/clear"));
         assert!(out2.markdown.contains("命令"));
@@ -690,8 +741,16 @@ mod tests {
 
     #[test]
     fn empty_range_reports_zero() {
-        let prompts = vec![mk("/p/a", day_start_ms("2026-01-01").unwrap(), "x", false)];
-        let out = build(&prompts, &params("2026-05-16", "2026-05-17", false, Lang::Zh));
+        let prompts = vec![mk(
+            "/p/a",
+            day_start_ms("2026-01-01").unwrap(),
+            "x",
+            crate::models::PromptKind::Human,
+        )];
+        let out = build(
+            &prompts,
+            &params("2026-05-16", "2026-05-17", false, Lang::Zh),
+        );
         assert_eq!(out.prompt_count, 0);
         assert!(out.markdown.contains("没有 prompt"));
     }
@@ -700,10 +759,23 @@ mod tests {
     fn english_labels_render() {
         let d16 = day_start_ms("2026-05-16").unwrap();
         let prompts = vec![
-            mk("/p/alpha", d16 + 1_000, "hello world", false),
-            mk("/p/alpha", d16 + 2_000, "/clear", true),
+            mk(
+                "/p/alpha",
+                d16 + 1_000,
+                "hello world",
+                crate::models::PromptKind::Human,
+            ),
+            mk(
+                "/p/alpha",
+                d16 + 2_000,
+                "/clear",
+                crate::models::PromptKind::Command,
+            ),
         ];
-        let out = build(&prompts, &params("2026-05-16", "2026-05-16", true, Lang::En));
+        let out = build(
+            &prompts,
+            &params("2026-05-16", "2026-05-16", true, Lang::En),
+        );
         assert!(out.markdown.contains("# Claude Code Prompt Export"));
         assert!(out.markdown.contains("Time range"));
         assert!(out.markdown.contains("prompts"));
@@ -787,12 +859,8 @@ mod tests {
         };
 
         // 不含工具：纯工具消息整条消失
-        let (md, count) = build_conversation_markdown(
-            &detail,
-            None,
-            &conversation_options(false),
-            Lang::Zh,
-        );
+        let (md, count) =
+            build_conversation_markdown(&detail, None, &conversation_options(false), Lang::Zh);
         assert!(md.contains("# 对话导出"));
         assert!(md.contains("帮我重构"));
         assert!(md.contains("已完成"));
@@ -804,12 +872,8 @@ mod tests {
         assert_eq!(count, 2);
 
         // 含工具：thinking 引用块 + tool_use 围栏
-        let (md2, count2) = build_conversation_markdown(
-            &detail,
-            None,
-            &conversation_options(true),
-            Lang::Zh,
-        );
+        let (md2, count2) =
+            build_conversation_markdown(&detail, None, &conversation_options(true), Lang::Zh);
         assert!(md2.contains("💭 思考过程"));
         assert!(md2.contains("> 想一想"));
         assert!(md2.contains("🔧 工具调用 · Bash"));
@@ -818,12 +882,8 @@ mod tests {
         assert_eq!(count2, 3);
 
         // 英文文案
-        let (md3, _) = build_conversation_markdown(
-            &detail,
-            None,
-            &conversation_options(true),
-            Lang::En,
-        );
+        let (md3, _) =
+            build_conversation_markdown(&detail, None, &conversation_options(true), Lang::En);
         assert!(md3.contains("# Conversation Export"));
         assert!(md3.contains("🧑 User"));
         assert!(md3.contains("💭 Thinking"));

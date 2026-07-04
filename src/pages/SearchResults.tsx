@@ -3,6 +3,7 @@ import { Check, Download, FolderOpen, SearchX } from "lucide-react";
 import { useStore } from "@/store";
 import { useSearch } from "@/hooks/queries";
 import { PromptList, type PromptListItem } from "@/components/PromptList";
+import { PromptVisibilityFilters } from "@/components/PromptVisibilityFilters";
 import { Button, CenterMessage, Spinner } from "@/components/ui";
 import { api, errMessage } from "@/lib/api";
 import { getCurrentLang, useT } from "@/i18n";
@@ -10,14 +11,19 @@ import { formatNumber } from "@/lib/utils";
 import type { ExportResult } from "@/lib/types";
 
 export function SearchResults() {
-  const { query, scope, currentProject, currentProjectName, includeCommands } =
-    useStore();
+  const {
+    query,
+    scope,
+    currentProject,
+    currentProjectName,
+    promptVisibility,
+  } = useStore();
   const t = useT();
   const projectFilter = scope === "folder" ? currentProject : null;
   const { data, isLoading, isError, error, debouncedQuery } = useSearch(
     query,
     projectFilter,
-    includeCommands
+    promptVisibility
   );
 
   // memo 保持引用稳定：PromptList 以 items 引用变化作为重置分批的信号
@@ -40,7 +46,7 @@ export function SearchResults() {
       const res = await api.exportSearchResults({
         query: debouncedQuery,
         projectFilter,
-        includeCommands,
+        visibility: promptVisibility,
         write: true,
         lang: getCurrentLang(),
       });
@@ -93,6 +99,8 @@ export function SearchResults() {
           {t("exportSearchResults")}
         </Button>
       </div>
+
+      <PromptVisibilityFilters className="mb-3" />
 
       {exportError && (
         <p className="mb-3 text-xs text-danger">

@@ -32,6 +32,26 @@ const sourceLabelKey: Record<string, DictKey> = {
   both: "sourceBoth",
 };
 
+const kindLabelKey: Record<Exclude<PromptEntry["kind"], "human">, DictKey> = {
+  command: "commandBadge",
+  meta: "metaBadge",
+  sidechain: "sidechainBadge",
+  system: "systemBadge",
+  queued: "queuedBadge",
+  sdk: "sdkBadge",
+  other: "otherBadge",
+};
+
+const kindTone: Record<Exclude<PromptEntry["kind"], "human">, "default" | "muted" | "outline" | "warning" | "success" | "accent"> = {
+  command: "warning",
+  meta: "outline",
+  sidechain: "muted",
+  system: "warning",
+  queued: "default",
+  sdk: "default",
+  other: "outline",
+};
+
 export function PromptCard({
   entry,
   ranges,
@@ -48,6 +68,12 @@ export function PromptCard({
   const { copied, copy } = useCopy();
   const collapsible = entry.charCount > 150 || entry.text.includes("\n");
   const sourceKey = sourceLabelKey[entry.source];
+  const conversationHref =
+    entry.sessionId && entry.messageUuid
+      ? `/conversation/${entry.sessionId}?m=${encodeURIComponent(entry.messageUuid)}`
+      : entry.sessionId
+        ? `/conversation/${entry.sessionId}?t=${entry.timestamp}`
+        : "";
 
   return (
     <div className="rounded-xl border border-border bg-surface p-3.5 transition-colors hover:border-accent/40">
@@ -91,10 +117,10 @@ export function PromptCard({
           </Link>
         )}
 
-        {entry.isCommand && (
-          <Badge tone="warning">
-            <Command size={10} />
-            {t("commandBadge")}
+        {entry.kind !== "human" && (
+          <Badge tone={kindTone[entry.kind as Exclude<PromptEntry["kind"], "human">]}>
+            {entry.kind === "command" && <Command size={10} />}
+            {t(kindLabelKey[entry.kind as Exclude<PromptEntry["kind"], "human">])}
           </Badge>
         )}
 
@@ -131,7 +157,7 @@ export function PromptCard({
           </button>
           {entry.sessionId && (
             <Link
-              to={`/conversation/${entry.sessionId}?t=${entry.timestamp}`}
+              to={conversationHref}
               onClick={() => setQuery("")}
               className="flex items-center gap-1 font-medium text-accent hover:underline"
             >
