@@ -146,6 +146,8 @@ struct ConvLine {
     version: Option<String>,
     is_sidechain: Option<bool>,
     is_meta: Option<bool>,
+    is_compact_summary: Option<bool>,
+    is_visible_in_transcript_only: Option<bool>,
     origin: Option<ConvOrigin>,
     #[serde(rename = "promptSource")]
     prompt_source: Option<String>,
@@ -281,6 +283,10 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
         }
         if version.is_none() {
             version = parsed.version.clone();
+        }
+
+        if is_claude_compact_summary(&parsed) {
+            continue;
         }
 
         // assistant 行（含 sidechain，同样计入用量）提取 token 用量
@@ -661,6 +667,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
             None => continue,
         };
         let role = msg.role.clone().unwrap_or_else(|| ltype.to_string());
+        let is_meta = parsed.is_meta.unwrap_or(false) || is_claude_compact_summary(&parsed);
         let blocks = content_to_parsed_blocks(msg.content.as_ref());
         if blocks.is_empty() {
             continue;
@@ -672,7 +679,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
         }
         let replay_user_text = if ltype == "user"
             && role == "user"
-            && !parsed.is_meta.unwrap_or(false)
+            && !is_meta
             && !parsed.is_sidechain.unwrap_or(false)
         {
             parsed
@@ -713,7 +720,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
             &role,
             ts.unwrap_or(0),
             parsed.is_sidechain.unwrap_or(false),
-            parsed.is_meta.unwrap_or(false),
+            is_meta,
             parsed.attribution_skill.clone(),
             blocks,
         );
@@ -1872,7 +1879,15 @@ fn classify_history_prompt_kind(display: &str) -> PromptKind {
     }
 }
 
+fn is_claude_compact_summary(line: &ConvLine) -> bool {
+    let _transcript_only = line.is_visible_in_transcript_only.unwrap_or(false);
+    line.is_compact_summary.unwrap_or(false)
+}
+
 fn classify_conversation_prompt_kind(line: &ConvLine, content: &serde_json::Value) -> PromptKind {
+    if is_claude_compact_summary(line) {
+        return PromptKind::Meta;
+    }
     if line.is_sidechain.unwrap_or(false) {
         return PromptKind::Sidechain;
     }
@@ -3151,6 +3166,8 @@ mod tests {
             version: None,
             is_sidechain: None,
             is_meta: None,
+            is_compact_summary: None,
+            is_visible_in_transcript_only: None,
             origin: Some(ConvOrigin {
                 kind: Some("human".to_string()),
             }),
@@ -3193,6 +3210,8 @@ mod tests {
             version: None,
             is_sidechain: None,
             is_meta: None,
+            is_compact_summary: None,
+            is_visible_in_transcript_only: None,
             origin: None,
             prompt_source: Some("typed".to_string()),
             request_id: None,
@@ -3271,6 +3290,87 @@ mod tests {
         assert_eq!(
             parsed.user_prompts[1].text,
             format!("/superpowers:requesting-code-review {real_prompt}")
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claude_compact_summary_is_metadata_not_prompt() {
+        let path = std::env::temp_dir().join(format!(
+            "cc_history_viewer_claude_compact_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let compact_text = concat!(
+            "This session is being continued from a previous conversation that ran out of context. ",
+            "The summary below covers the earlier portion of the conversation.\n\nSummary:\n",
+            "- Previous implementation notes."
+        );
+        let real_prompt = "继续修复 Claude Code compact 解析";
+        let jsonl = [
+            json!({
+                "type": "user",
+                "uuid": "compact-summary",
+                "timestamp": "2026-07-05T03:20:32.769Z",
+                "cwd": "/tmp/project",
+                "isVisibleInTranscriptOnly": true,
+                "isCompactSummary": true,
+                "message": {"role": "user", "content": compact_text}
+            }),
+            json!({
+                "type": "user",
+                "uuid": "real-user",
+                "timestamp": "2026-07-05T03:21:00.000Z",
+                "cwd": "/tmp/project",
+                "message": {"role": "user", "content": real_prompt}
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "assistant-answer",
+                "timestamp": "2026-07-05T03:21:01.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "已处理"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let parsed = parse_conversation_file(&path).expect("fixture 应能解析");
+        assert_eq!(parsed.first_prompt, real_prompt);
+        assert_eq!(parsed.message_count, 2);
+        assert_eq!(parsed.user_prompts.len(), 1);
+        assert_eq!(parsed.user_prompts[0].text, real_prompt);
+
+        let detail = parse_conversation_detail(&path).expect("fixture 应能解析");
+        let compact_messages = detail
+            .messages
+            .iter()
+            .filter(|m| m.uuid == "compact-summary")
+            .collect::<Vec<_>>();
+        assert_eq!(compact_messages.len(), 1);
+        assert!(compact_messages[0].is_meta);
+        assert_eq!(compact_messages[0].role, "user");
+        assert!(compact_messages[0].blocks.iter().any(|b| {
+            b.text
+                .as_deref()
+                .is_some_and(|text| text.starts_with("This session is being continued"))
+        }));
+        assert_eq!(
+            detail
+                .messages
+                .iter()
+                .filter(|m| m.role == "user" && !m.is_meta)
+                .count(),
+            1
         );
 
         let _ = std::fs::remove_file(&path);

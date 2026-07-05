@@ -88,3 +88,26 @@ Codex 会话中，如果用户 prompt 或 assistant 回答里只是“引用/粘
 - 新增文本级测试：嵌入 JSON 示例的 `<command-name>/model</command-name>` 不会被改写为 `/model`。
 - 新增 Codex 集成测试：`parse_codex_session_file` 和 `parse_codex_conversation_detail` 都保留用户粘贴的 JSON 示例和 assistant 回答中的 XML 代码块。
 - `cargo test --manifest-path src-tauri/Cargo.toml`
+
+# Fix Report - Claude Code Compact Summary Misclassified As Prompt
+
+## Bug 描述
+
+Claude Code compact 后写入的上下文恢复摘要会以 `type=user` / `message.role=user` 形式出现在 project JSONL 中，导致会话列表标题、prompt 索引和统计把它当成真实用户输入。详情页也会把它显示为普通用户气泡。
+
+## 根因
+
+解析结构体没有读取 Claude Code 的 `isCompactSummary` 和 `isVisibleInTranscriptOnly` 字段，只按 `type` 与 `message.role` 判断用户消息。真实数据扫描显示 compact summary 均带 `isCompactSummary: true`，且当前样本中同时带 `isVisibleInTranscriptOnly: true`。
+
+## 最终方案
+
+- `ConvLine` 读取 `isCompactSummary` / `isVisibleInTranscriptOnly`。
+- 文件级解析中跳过 `isCompactSummary` 行，使其不进入真实 prompt、标题候选和消息数。
+- 详情解析中保留 compact summary，但标记为 `is_meta=true`，默认受“元信息”开关隐藏，避免展示为普通用户输入。
+- 缓存版本升到 17，避免复用旧索引结果。
+
+## 验证
+
+- 扫描本地 Claude projects：11 条 compact summary 全部带 `isCompactSummary=true` 与 `isVisibleInTranscriptOnly=true`，未发现旧格式漏标样本。
+- 新增回归测试 `claude_compact_summary_is_metadata_not_prompt`，覆盖标题、prompt 数、消息数和详情 meta 标记。
+- `cargo test --manifest-path src-tauri/Cargo.toml`
