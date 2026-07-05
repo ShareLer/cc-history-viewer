@@ -53,6 +53,8 @@ export const api = {
 
   refreshIndex: () => invoke<IndexMeta>("refresh_index"),
 
+  rebuildIndex: () => invoke<IndexMeta>("rebuild_index"),
+
   buildExport: (p: ExportParams) =>
     invoke<ExportResult>("build_prompt_export", {
       startDate: p.startDate,
@@ -86,8 +88,10 @@ export const api = {
       includeTools: p.includeTools,
       includeSkills: p.includeSkills,
       includeMeta: p.includeMeta,
+      includeCodexCommentary: p.includeCodexCommentary,
+      includeSubagent: p.includeSubagent,
       includeTime: p.includeTime,
-      messageUuids: p.messageUuids,
+      messageIndexes: p.messageIndexes,
       write: p.write,
       lang: p.lang,
     }),

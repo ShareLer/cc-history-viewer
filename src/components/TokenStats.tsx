@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import type { DayUsage, UsageStats } from "@/lib/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui";
-import { useT } from "@/i18n";
+import { getCurrentLang, useT } from "@/i18n";
 import { encodePath, formatNumber, formatTokens } from "@/lib/utils";
 
 const AXIS = "var(--muted)";
@@ -28,7 +28,8 @@ const ACCENT = "var(--accent)";
 
 /** 成本展示："$X.XX"，≥$100 显示整数 */
 function formatCost(v: number): string {
-  if (v >= 100) return `$${Math.round(v).toLocaleString("zh-CN")}`;
+  const locale = getCurrentLang() === "zh" ? "zh-CN" : "en-US";
+  if (v >= 100) return `$${Math.round(v).toLocaleString(locale)}`;
   return `$${v.toFixed(2)}`;
 }
 

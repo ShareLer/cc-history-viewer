@@ -5,7 +5,7 @@ import { Languages, Layers, RefreshCw, Settings, Terminal } from "lucide-react";
 import { useStore } from "@/store";
 import { useLang, useT } from "@/i18n";
 import { api } from "@/lib/api";
-import { cn, decodePath } from "@/lib/utils";
+import { cn, decodePath, pathBaseName } from "@/lib/utils";
 import { SearchBar } from "./SearchBar";
 import { SettingsDialog } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
@@ -13,34 +13,10 @@ import { ThemeToggle } from "./ThemeToggle";
 import { Button } from "./ui";
 import { SearchResults } from "@/pages/SearchResults";
 
-export type LayoutOutletContext = {
-  refreshing: boolean;
-};
-
 const MIN_REFRESH_FEEDBACK_MS = 500;
 
 function delay(ms: number) {
   return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
-}
-
-function RefreshSpinner() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      className="h-4 w-4 animate-spin"
-      style={{ animationDuration: "0.8s" }}
-      aria-hidden="true"
-    >
-      <circle cx="12" cy="4" r="1.75" fill="currentColor" opacity="1" />
-      <circle cx="17.66" cy="6.34" r="1.75" fill="currentColor" opacity="0.9" />
-      <circle cx="20" cy="12" r="1.75" fill="currentColor" opacity="0.78" />
-      <circle cx="17.66" cy="17.66" r="1.75" fill="currentColor" opacity="0.64" />
-      <circle cx="12" cy="20" r="1.75" fill="currentColor" opacity="0.5" />
-      <circle cx="6.34" cy="17.66" r="1.75" fill="currentColor" opacity="0.38" />
-      <circle cx="4" cy="12" r="1.75" fill="currentColor" opacity="0.26" />
-      <circle cx="6.34" cy="6.34" r="1.75" fill="currentColor" opacity="0.18" />
-    </svg>
-  );
 }
 
 export function Layout() {
@@ -60,17 +36,22 @@ export function Layout() {
   const mainRef = useRef<HTMLElement>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const lastProjectPathRef = useRef<string | null>(null);
 
   // 根据路由派生「当前文件夹」，使其不受搜索时页面卸载的影响
   useEffect(() => {
     const m = location.pathname.match(/^\/project\/(.+)$/);
     if (m) {
       const path = decodePath(m[1]);
-      const name = path.split("/").filter(Boolean).pop() || path;
+      const name = pathBaseName(path);
       setCurrentProject(path, name);
-      setScope("folder");
+      if (lastProjectPathRef.current !== path) {
+        setScope("folder");
+        lastProjectPathRef.current = path;
+      }
     } else {
       setCurrentProject(null);
+      lastProjectPathRef.current = null;
     }
   }, [location.pathname, setCurrentProject, setScope]);
 
@@ -109,7 +90,7 @@ export function Layout() {
             setQuery("");
             navigate("/");
           }}
-          className="flex shrink-0 items-center gap-2"
+          className="flex shrink-0 items-center gap-2 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
           title={t("backHome")}
         >
           <span
@@ -131,7 +112,7 @@ export function Layout() {
           onClick={() => setIncludeCommands(!includeCommands)}
           title={includeCommands ? t("commandsShownTitle") : t("commandsHiddenTitle")}
           className={cn(
-            "flex h-9 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition-colors",
+            "flex h-9 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
             includeCommands
               ? "border-accent/40 bg-accent/15 text-accent"
               : "border-border text-muted hover:text-foreground"
@@ -148,7 +129,10 @@ export function Layout() {
           disabled={refreshing}
           title={t("refreshTitle")}
         >
-          {refreshing ? <RefreshSpinner /> : <RefreshCw size={16} />}
+          <RefreshCw
+            size={16}
+            className={cn(refreshing && "animate-spin")}
+          />
         </Button>
 
         <Button
@@ -163,7 +147,7 @@ export function Layout() {
         <button
           onClick={() => setLang(lang === "zh" ? "en" : "zh")}
           title={t("switchLanguage")}
-          className="flex h-9 shrink-0 items-center gap-1 rounded-lg border border-border px-2 text-xs font-medium text-muted transition-colors hover:text-foreground"
+          className="flex h-9 shrink-0 items-center gap-1 rounded-lg border border-border px-2 text-xs font-medium text-muted transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
         >
           <Languages size={14} />
           {t("langBadge")}
@@ -180,11 +164,7 @@ export function Layout() {
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />
         <main ref={mainRef} className="flex-1 overflow-y-auto">
-          {searching ? (
-            <SearchResults />
-          ) : (
-            <Outlet context={{ refreshing } satisfies LayoutOutletContext} />
-          )}
+          {searching ? <SearchResults /> : <Outlet />}
         </main>
       </div>
     </div>

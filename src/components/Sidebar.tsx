@@ -113,7 +113,7 @@ export function Sidebar() {
                 </span>
                 {p.hasConversations && (
                   <span>
-                    · {t("sessionCountLabel", { count: p.sessionCount })}
+                    · {t("sessionCountLabel", { count: formatNumber(p.sessionCount) })}
                   </span>
                 )}
               </div>

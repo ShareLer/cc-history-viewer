@@ -22,6 +22,7 @@ const sortOptions: { value: SortMode; labelKey: DictKey }[] = [
 ];
 
 type SessionAgentFilter = "all" | AgentKind;
+type PromptAgentFilter = "all" | AgentKind;
 
 const sessionAgentFilters: {
   value: SessionAgentFilter;
@@ -31,6 +32,10 @@ const sessionAgentFilters: {
   { value: "claudeCode", labelKey: "agentClaudeCode" },
   { value: "codex", labelKey: "agentCodex" },
 ];
+const promptAgentFilters: {
+  value: PromptAgentFilter;
+  labelKey: DictKey;
+}[] = sessionAgentFilters;
 
 function ListSkeleton() {
   return (
@@ -55,6 +60,8 @@ function TabButton({
 }) {
   return (
     <button
+      role="radio"
+      aria-checked={active}
       onClick={onClick}
       className={cn(
         "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
@@ -110,6 +117,8 @@ export function ProjectPrompts() {
   const t = useT();
   const [sort, setSort] = useState<SortMode>("newest");
   const [tab, setTab] = useState<"prompts" | "sessions">("sessions");
+  const [promptAgentFilter, setPromptAgentFilter] =
+    useState<PromptAgentFilter>("all");
   const [sessionAgentFilter, setSessionAgentFilter] =
     useState<SessionAgentFilter>("all");
 
@@ -122,8 +131,13 @@ export function ProjectPrompts() {
 
   // memo 保持引用稳定：PromptList 以 items 引用变化作为重置分批的信号
   const promptItems = useMemo(
-    () => (promptsQ.data ?? []).map((entry) => ({ entry })),
-    [promptsQ.data]
+    () =>
+      (promptsQ.data ?? [])
+        .filter((entry) =>
+          promptAgentFilter === "all" ? true : entry.agent === promptAgentFilter
+        )
+        .map((entry) => ({ entry })),
+    [promptAgentFilter, promptsQ.data]
   );
   const filteredSessions = useMemo(() => {
     const sessions = sessionsQ.data ?? [];
@@ -165,7 +179,11 @@ export function ProjectPrompts() {
       </div>
 
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center rounded-lg border border-border bg-surface p-0.5">
+        <div
+          role="radiogroup"
+          aria-label={t("projectViewModeLabel")}
+          className="flex items-center rounded-lg border border-border bg-surface p-0.5"
+        >
           <TabButton
             active={tab === "sessions"}
             onClick={() => setTab("sessions")}
@@ -183,28 +201,64 @@ export function ProjectPrompts() {
         </div>
 
         {tab === "prompts" && (
-          <div className="flex items-center gap-1 rounded-lg border border-border bg-surface p-0.5">
-            {sortOptions.map((o) => (
-              <button
-                key={o.value}
-                onClick={() => setSort(o.value)}
-                className={cn(
-                  "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-                  sort === o.value
-                    ? "bg-accent text-accent-fg"
-                    : "text-muted hover:text-foreground"
-                )}
-              >
-                {t(o.labelKey)}
-              </button>
-            ))}
+          <div className="flex flex-wrap items-center gap-2">
+            <div
+              role="radiogroup"
+              aria-label={t("promptAgentFilterLabel")}
+              className="flex items-center gap-1 rounded-lg border border-border bg-surface p-0.5"
+            >
+              {promptAgentFilters.map((o) => (
+                <button
+                  key={o.value}
+                  role="radio"
+                  aria-checked={promptAgentFilter === o.value}
+                  onClick={() => setPromptAgentFilter(o.value)}
+                  className={cn(
+                    "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+                    promptAgentFilter === o.value
+                      ? "bg-accent text-accent-fg"
+                      : "text-muted hover:text-foreground"
+                  )}
+                >
+                  {t(o.labelKey)}
+                </button>
+              ))}
+            </div>
+            <div
+              role="radiogroup"
+              aria-label={t("sortModeLabel")}
+              className="flex items-center gap-1 rounded-lg border border-border bg-surface p-0.5"
+            >
+              {sortOptions.map((o) => (
+                <button
+                  key={o.value}
+                  role="radio"
+                  aria-checked={sort === o.value}
+                  onClick={() => setSort(o.value)}
+                  className={cn(
+                    "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+                    sort === o.value
+                      ? "bg-accent text-accent-fg"
+                      : "text-muted hover:text-foreground"
+                  )}
+                >
+                  {t(o.labelKey)}
+                </button>
+              ))}
+            </div>
           </div>
         )}
         {tab === "sessions" && (
-          <div className="flex items-center gap-1 rounded-lg border border-border bg-surface p-0.5">
+          <div
+            role="radiogroup"
+            aria-label={t("sessionAgentFilterLabel")}
+            className="flex items-center gap-1 rounded-lg border border-border bg-surface p-0.5"
+          >
             {sessionAgentFilters.map((o) => (
               <button
                 key={o.value}
+                role="radio"
+                aria-checked={sessionAgentFilter === o.value}
                 onClick={() => setSessionAgentFilter(o.value)}
                 className={cn(
                   "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",

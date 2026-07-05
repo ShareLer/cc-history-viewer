@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { format, startOfMonth, subDays } from "date-fns";
 import {
   Calendar,
@@ -24,6 +24,7 @@ import { cn, formatNumber, prettyPath } from "@/lib/utils";
 import type { ExportGroupBy, ExportResult } from "@/lib/types";
 
 const fmtDay = (d: Date) => format(d, "yyyy-MM-dd");
+const currentDay = () => new Date();
 
 const groupOptions: { value: ExportGroupBy; labelKey: DictKey }[] = [
   { value: "project", labelKey: "groupByProject" },
@@ -56,7 +57,7 @@ export function Export() {
   const t = useT();
   const { lang } = useLang();
 
-  const today = useMemo(() => new Date(), []);
+  const today = currentDay();
   const [startDate, setStartDate] = useState(() => fmtDay(subDays(today, 6)));
   const [endDate, setEndDate] = useState(() => fmtDay(today));
   const [project, setProject] = useState("");
@@ -83,21 +84,45 @@ export function Export() {
     setEndDate(fmtDay(e));
   };
 
-  const presets: { labelKey: DictKey; run: () => void }[] = [
-    { labelKey: "last7Days", run: () => preset(subDays(today, 6), today) },
-    { labelKey: "last30Days", run: () => preset(subDays(today, 29), today) },
-    { labelKey: "thisMonth", run: () => preset(startOfMonth(today), today) },
+  const presets: { labelKey: DictKey; disabled?: boolean; run: () => void }[] = [
+    {
+      labelKey: "last7Days",
+      run: () => {
+        const now = currentDay();
+        preset(subDays(now, 6), now);
+      },
+    },
+    {
+      labelKey: "last30Days",
+      run: () => {
+        const now = currentDay();
+        preset(subDays(now, 29), now);
+      },
+    },
+    {
+      labelKey: "thisMonth",
+      run: () => {
+        const now = currentDay();
+        preset(startOfMonth(now), now);
+      },
+    },
     {
       labelKey: "allTime",
+      disabled: !statsQ.data?.firstUse,
       run: () => {
         const first = statsQ.data?.firstUse;
-        if (first) preset(new Date(first), today);
+        if (first) preset(new Date(first), currentDay());
       },
     },
   ];
 
   const count = previewQ.data?.promptCount ?? 0;
   const canExport = rangeValid && count > 0 && !exporting;
+
+  useEffect(() => {
+    setResult(null);
+    setError(null);
+  }, [endDate, groupBy, lang, project, promptVisibility, startDate]);
 
   const handleExport = async () => {
     setExporting(true);
@@ -178,7 +203,8 @@ export function Export() {
                 <button
                   key={p.labelKey}
                   onClick={p.run}
-                  className="flex items-center gap-1 rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-muted transition-colors hover:border-accent/40 hover:text-foreground"
+                  disabled={p.disabled}
+                  className="flex items-center gap-1 rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-muted transition-colors hover:border-accent/40 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <Calendar size={12} />
                   {t(p.labelKey)}
@@ -208,10 +234,16 @@ export function Export() {
             </Field>
 
             <Field label={t("groupByLabel")}>
-              <div className="flex items-center rounded-lg border border-border bg-surface p-0.5">
+              <div
+                role="radiogroup"
+                aria-label={t("groupByLabel")}
+                className="flex items-center rounded-lg border border-border bg-surface p-0.5"
+              >
                 {groupOptions.map((o) => (
                   <button
                     key={o.value}
+                    role="radio"
+                    aria-checked={groupBy === o.value}
                     onClick={() => setGroupBy(o.value)}
                     className={cn(
                       "rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors",

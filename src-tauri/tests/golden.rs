@@ -52,9 +52,9 @@ fn session_golden() {
     assert_eq!(r.version.as_deref(), Some("2.0.0"));
     assert_eq!(r.started_at, iso_ms("2026-05-16T02:00:00.000Z"));
     assert_eq!(r.ended_at, iso_ms("2026-05-16T02:01:35.000Z"));
-    // 9 行 user/assistant 计入消息数（system/local_command 行不算消息）；
-    // isMeta=true 的 user 行仍会作为 prompt 保留，但会被标记为 Meta。
-    assert_eq!(r.message_count, 9);
+    // message_count 使用跨 agent 统一口径：真实 user prompt + assistant answer。
+    // 纯 tool_use / tool_result 载体行、Meta/System 注入不计入会话消息数。
+    assert_eq!(r.message_count, 6);
 
     // prompt 提取：tool_result-only 不算 prompt；Meta / Command / Sidechain 会被保留并打 kind。
     let texts: Vec<&str> = r.user_prompts.iter().map(|p| p.text.as_str()).collect();

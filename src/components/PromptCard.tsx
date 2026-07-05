@@ -68,6 +68,8 @@ export function PromptCard({
   const { copied, copy } = useCopy();
   const collapsible = entry.charCount > 150 || entry.text.includes("\n");
   const sourceKey = sourceLabelKey[entry.source];
+  const agentLabel =
+    entry.agent === "codex" ? t("agentCodex") : t("agentClaudeCode");
   const conversationHref =
     entry.sessionId && entry.messageUuid
       ? `/conversation/${entry.sessionId}?m=${encodeURIComponent(entry.messageUuid)}`
@@ -79,8 +81,18 @@ export function PromptCard({
     <div className="rounded-xl border border-border bg-surface p-3.5 transition-colors hover:border-accent/40">
       <div
         onClick={() => collapsible && setExpanded((v) => !v)}
+        onKeyDown={(e) => {
+          if (!collapsible) return;
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setExpanded((v) => !v);
+          }
+        }}
+        role={collapsible ? "button" : undefined}
+        tabIndex={collapsible ? 0 : undefined}
+        aria-expanded={collapsible ? expanded : undefined}
         className={cn(
-          "whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground",
+          "whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
           collapsible && "cursor-pointer",
           !expanded && "line-clamp-3"
         )}
@@ -91,7 +103,7 @@ export function PromptCard({
       {collapsible && (
         <button
           onClick={() => setExpanded((v) => !v)}
-          className="mt-1 flex items-center gap-0.5 text-[11px] font-medium text-accent hover:underline"
+          className="mt-1 flex items-center gap-0.5 rounded text-[11px] font-medium text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
         >
           {expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
           {expanded ? t("collapse") : t("expandFull")}
@@ -125,6 +137,9 @@ export function PromptCard({
         )}
 
         <Badge tone="muted">{sourceKey ? t(sourceKey) : entry.source}</Badge>
+        <Badge tone={entry.agent === "codex" ? "accent" : "muted"}>
+          {agentLabel}
+        </Badge>
 
         {entry.gitBranch && (
           <span className="flex items-center gap-1">
@@ -149,7 +164,7 @@ export function PromptCard({
             }}
             title={t("copyPrompt")}
             className={cn(
-              "flex items-center transition-colors",
+              "flex items-center rounded transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
               copied ? "text-success" : "text-muted hover:text-accent"
             )}
           >

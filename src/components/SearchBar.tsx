@@ -43,8 +43,14 @@ export function SearchBar() {
         )}
       </div>
 
-      <div className="flex shrink-0 items-center rounded-lg border border-border bg-surface p-0.5">
+      <div
+        role="radiogroup"
+        aria-label={t("searchScopeLabel")}
+        className="flex shrink-0 items-center rounded-lg border border-border bg-surface p-0.5"
+      >
         <button
+          role="radio"
+          aria-checked={scope === "global"}
           onClick={() => setScope("global")}
           className={cn(
             "flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
@@ -57,6 +63,8 @@ export function SearchBar() {
           {t("scopeGlobal")}
         </button>
         <button
+          role="radio"
+          aria-checked={scope === "folder"}
           disabled={!folderAvailable}
           onClick={() => folderAvailable && setScope("folder")}
           title={folderAvailable ? "" : t("scopeFolderDisabledTitle")}

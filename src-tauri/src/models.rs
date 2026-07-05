@@ -166,6 +166,9 @@ pub struct ChatMessage {
     pub call_id: Option<String>,
     pub timestamp: i64,
     pub is_sidechain: bool,
+    /// 是否为子代理相关消息：sidechain 消息、子代理派发工具调用（Agent/Task/
+    /// spawn_agent/wait_agent/close_agent）及其配对结果。前端/导出用独立开关控制其显隐。
+    pub is_subagent: bool,
     /// JSONL 顶层 isMeta：框架/工具注入的 user-channel 元信息，不是真实用户 prompt
     pub is_meta: bool,
     /// "command" | "skill" | null

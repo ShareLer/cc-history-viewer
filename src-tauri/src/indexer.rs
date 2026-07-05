@@ -5,6 +5,7 @@ use crate::models::*;
 use crate::parser::{self, ConvFileResult, RawPrompt};
 use crate::pricing;
 use crate::state::DataPaths;
+use crate::util::project_name;
 use chrono::{Datelike, Local, TimeZone, Timelike};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -17,8 +18,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEDUP_WINDOW_MS: i64 = 5 * 60 * 1000;
 
 /// 缓存格式版本；结构或解析规则变化时递增，旧缓存自动失效
-/// （v9：Claude Code 子代理会话不再作为独立会话索引，索引与缓存需重建）
-const CACHE_VERSION: u32 = 9;
+/// （v12：Codex 子代理会话不再作为独立会话索引；ConvFileResult 增加 is_subagent 字段）
+/// （v13：Codex skill 注入不再作为 prompt；compaction 摘要不再计入消息数）
+/// （v14：Claude Code 会话标题跳过控制命令，优先使用命令参数里的真实请求）
+/// （v15：Claude Code 去除技能/上下文预派发造成的 replay 重复用户 prompt）
+/// （v16：嵌入在普通文本/代码示例中的 command wrapper 不再被误改写为 /model）
+const CACHE_VERSION: u32 = 16;
 
 /// 构建好的全量索引（仅驻留内存；磁盘缓存见 CacheV2）
 pub struct AppIndex {
@@ -45,8 +50,8 @@ struct CacheV2 {
     version: u32,
     /// history.jsonl 的绝对路径；切换数据源时即使 mtime 巧合相同也必须重解析
     history_path: String,
-    /// history.jsonl 的 mtime(ms)；不一致则重解析 history
-    history_mtime: i64,
+    /// history.jsonl 的 freshness；切换数据源或文件变化时必须重解析 history
+    history_stamp: FileStamp,
     history_prompts: Vec<RawPrompt>,
     /// 对话文件绝对路径 -> 文件级缓存
     files: HashMap<String, FileCache>,
@@ -54,19 +59,26 @@ struct CacheV2 {
 
 #[derive(Serialize, Deserialize)]
 struct FileCache {
-    /// 文件 mtime(ms)；不一致则重解析该文件
-    mtime: i64,
+    /// 文件 freshness；不一致则重解析该文件
+    stamp: FileStamp,
     /// 原始解析结果（未经 resolve_missing_projects 回填，保证缓存与全量重建一致）
     conv: ConvFileResult,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct FileStamp {
+    /// 文件 mtime(ms)。0 表示 metadata 不可用，不能复用缓存。
+    mtime: i64,
+    len: u64,
+}
+
 impl CacheV2 {
-    /// 空缓存：history_mtime 取 -1，保证首次构建必然重解析
+    /// 空缓存：history_stamp 取无效值，保证首次构建必然重解析
     fn empty() -> Self {
         Self {
             version: CACHE_VERSION,
             history_path: String::new(),
-            history_mtime: -1,
+            history_stamp: FileStamp { mtime: 0, len: 0 },
             history_prompts: Vec::new(),
             files: HashMap::new(),
         }
@@ -76,11 +88,23 @@ impl CacheV2 {
 /// 读缓存：文件缺失 / 解析失败 / 版本不符 都视为无缓存
 fn read_cache_v2(path: &Path) -> Option<CacheV2> {
     let text = fs::read_to_string(path).ok()?;
-    let c: CacheV2 = serde_json::from_str(&text).ok()?;
-    if c.version != CACHE_VERSION {
+    let version = cache_version_from_json(&text)?;
+    if version != u64::from(CACHE_VERSION) {
         return None;
     }
+    let c: CacheV2 = serde_json::from_str(&text).ok()?;
     Some(c)
+}
+
+fn cache_version_from_json(text: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct CacheVersion {
+        version: u64,
+    }
+
+    serde_json::from_str::<CacheVersion>(text)
+        .ok()
+        .map(|v| v.version)
 }
 
 fn write_cache_v2(cache_path: &Path, cache: &CacheV2) {
@@ -88,12 +112,19 @@ fn write_cache_v2(cache_path: &Path, cache: &CacheV2) {
         let _ = fs::create_dir_all(parent);
     }
     if let Ok(json) = serde_json::to_string(cache) {
-        let _ = fs::write(cache_path, json);
+        let tmp = cache_path.with_extension("json.tmp");
+        if fs::write(&tmp, json).is_ok() {
+            let _ = fs::rename(&tmp, cache_path);
+        }
     }
 }
 
-fn history_cache_changed(cache: &CacheV2, history_path: &str, history_mtime: i64) -> bool {
-    cache.history_path != history_path || cache.history_mtime != history_mtime
+fn history_cache_changed(cache: &CacheV2, history_path: &str, history_stamp: FileStamp) -> bool {
+    cache.history_path != history_path || !stamp_matches(cache.history_stamp, history_stamp)
+}
+
+fn stamp_matches(cached: FileStamp, current: FileStamp) -> bool {
+    current.mtime > 0 && cached == current
 }
 
 // ----------------------------- 公共入口 -----------------------------
@@ -107,8 +138,8 @@ pub fn load_or_build(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
 
     // history.jsonl：mtime 一致则复用缓存的解析结果
     let history_path = paths.history.to_string_lossy().to_string();
-    let history_mtime = file_mtime_ms(&paths.history);
-    let history_changed = history_cache_changed(&old, &history_path, history_mtime);
+    let history_stamp = file_stamp(&paths.history);
+    let history_changed = history_cache_changed(&old, &history_path, history_stamp);
     let history_prompts = if history_changed {
         parser::parse_history(&paths.history)
     } else {
@@ -117,23 +148,23 @@ pub fn load_or_build(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
 
     // 对话文件：mtime 一致 → 复用；新增 / 变化 → 待重解析
     let mut files: HashMap<String, FileCache> = HashMap::with_capacity(conv_files.len());
-    let mut to_parse: Vec<(String, i64, PathBuf, AgentKind)> = Vec::new();
+    let mut to_parse: Vec<(String, FileStamp, PathBuf, AgentKind)> = Vec::new();
     for (f, agent) in conv_files {
         let key = f.to_string_lossy().to_string();
-        let mtime = file_mtime_ms(&f);
+        let stamp = file_stamp(&f);
         match old.files.remove(&key) {
-            Some(fc) if fc.mtime == mtime => {
+            Some(fc) if stamp_matches(fc.stamp, stamp) => {
                 files.insert(key, fc);
             }
-            _ => to_parse.push((key, mtime, f, agent)),
+            _ => to_parse.push((key, stamp, f, agent)),
         }
     }
     // old.files 中剩余条目对应磁盘已删除的文件，直接丢弃
     let removed_any = !old.files.is_empty();
 
     let reparsed_files = to_parse.len();
-    for (key, mtime, conv) in parse_files_par(to_parse) {
-        files.insert(key, FileCache { mtime, conv });
+    for (key, stamp, conv) in parse_files_par(to_parse) {
+        files.insert(key, FileCache { stamp, conv });
     }
 
     // 完全无重解析（history 也没变）才算「来自缓存」
@@ -142,7 +173,7 @@ pub fn load_or_build(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
     let cache = CacheV2 {
         version: CACHE_VERSION,
         history_path,
-        history_mtime,
+        history_stamp,
         history_prompts,
         files,
     };
@@ -160,24 +191,24 @@ pub fn load_or_build(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
 pub fn build_and_cache(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex {
     let conv_files = collect_all_conversation_files(paths);
     let history_path = paths.history.to_string_lossy().to_string();
-    let history_mtime = file_mtime_ms(&paths.history);
+    let history_stamp = file_stamp(&paths.history);
     let history_prompts = parser::parse_history(&paths.history);
 
-    let to_parse: Vec<(String, i64, PathBuf, AgentKind)> = conv_files
+    let to_parse: Vec<(String, FileStamp, PathBuf, AgentKind)> = conv_files
         .into_iter()
-        .map(|(f, agent)| (f.to_string_lossy().to_string(), file_mtime_ms(&f), f, agent))
+        .map(|(f, agent)| (f.to_string_lossy().to_string(), file_stamp(&f), f, agent))
         .collect();
     let reparsed_files = to_parse.len();
 
     let mut files: HashMap<String, FileCache> = HashMap::with_capacity(reparsed_files);
-    for (key, mtime, conv) in parse_files_par(to_parse) {
-        files.insert(key, FileCache { mtime, conv });
+    for (key, stamp, conv) in parse_files_par(to_parse) {
+        files.insert(key, FileCache { stamp, conv });
     }
 
     let cache = CacheV2 {
         version: CACHE_VERSION,
         history_path,
-        history_mtime,
+        history_stamp,
         history_prompts,
         files,
     };
@@ -190,16 +221,22 @@ pub fn build_and_cache(paths: &DataPaths, cache_path: Option<&Path>) -> AppIndex
 
 /// 并行解析一批对话文件；解析失败（不可读等）的文件直接丢弃，下次仍会重试。
 fn parse_files_par(
-    items: Vec<(String, i64, PathBuf, AgentKind)>,
-) -> Vec<(String, i64, ConvFileResult)> {
+    items: Vec<(String, FileStamp, PathBuf, AgentKind)>,
+) -> Vec<(String, FileStamp, ConvFileResult)> {
     items
         .into_par_iter()
-        .filter_map(|(key, mtime, path, agent)| {
+        .filter_map(|(key, stamp, path, agent)| {
             let parsed = match agent {
                 AgentKind::ClaudeCode => parser::parse_conversation_file(&path),
                 AgentKind::Codex => parser::parse_codex_session_file(&path),
             };
-            parsed.map(|conv| (key, mtime, conv))
+            match parsed {
+                Some(conv) => Some((key, stamp, conv)),
+                None => {
+                    eprintln!("failed to parse conversation file: {}", path.display());
+                    None
+                }
+            }
         })
         .collect()
 }
@@ -218,6 +255,17 @@ fn assemble_index(
     let history_prompts = cache.history_prompts;
     let mut conv_results: Vec<ConvFileResult> =
         cache.files.into_values().map(|fc| fc.conv).collect();
+    conv_results.sort_by(|a, b| {
+        a.path
+            .to_string_lossy()
+            .cmp(&b.path.to_string_lossy())
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+
+    // Codex 子代理文件（session_meta.source.subagent）不作为独立会话：整体排除，
+    // 使其不进入会话列表 / prompt / 项目聚合 / 用量统计，与 Claude 的 subagents/ 路径过滤对齐。
+    // 其在父会话里的表现（spawn_agent / wait_agent / close_agent 工具调用）不受影响。
+    conv_results.retain(|cr| !cr.is_subagent);
 
     // 1. cwd 缺失的会话用「真实路径字典」兜底解码目录名
     resolve_missing_projects(&history_prompts, &mut conv_results);
@@ -283,7 +331,7 @@ fn resolve_missing_projects(history: &[RawPrompt], conv: &mut [ConvFileResult]) 
         let resolved = decode_dict
             .get(&dir_name)
             .cloned()
-            .unwrap_or_else(|| naive_decode(&dir_name));
+            .unwrap_or_else(|| dir_name.clone());
         for up in cr.user_prompts.iter_mut() {
             if up.project.is_empty() {
                 up.project = resolved.clone();
@@ -293,19 +341,20 @@ fn resolve_missing_projects(history: &[RawPrompt], conv: &mut [ConvFileResult]) 
     }
 }
 
-/// 兜底解码：字典反查失败时，原样保留编码目录名。
-/// 编码规则把 '/' 与目录名里本来的 '-' 都写成 '-'，无法区分
-/// （盲目替换会把 my-project 错还原成 my/project），因此不再做 '-' → '/' 替换。
-fn naive_decode(encoded: &str) -> String {
-    encoded.to_string()
-}
-
 // ----------------------------- prompt 合并去重 -----------------------------
 
 fn merge_prompts(history: Vec<RawPrompt>, conv: &[ConvFileResult]) -> Vec<PromptEntry> {
     let mut all: Vec<RawPrompt> = history;
+    let mut seen_conversation_uuids: HashSet<(AgentKind, String)> = HashSet::new();
     for cr in conv {
-        all.extend(cr.user_prompts.iter().cloned());
+        for prompt in &cr.user_prompts {
+            if let Some(uuid) = prompt.message_uuid.as_deref().filter(|s| !s.is_empty()) {
+                if !seen_conversation_uuids.insert((prompt.agent, uuid.to_string())) {
+                    continue;
+                }
+            }
+            all.push(prompt.clone());
+        }
     }
 
     // 按 (工具, 项目, 文本, kind) 分组，避免跨工具或不同类型记录互相吞并
@@ -344,8 +393,35 @@ fn merge_prompts(history: Vec<RawPrompt>, conv: &[ConvFileResult]) -> Vec<Prompt
         }
     }
 
-    entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    entries.sort_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| prompt_agent_rank(a.agent).cmp(&prompt_agent_rank(b.agent)))
+            .then_with(|| a.project.cmp(&b.project))
+            .then_with(|| prompt_kind_rank(a.kind).cmp(&prompt_kind_rank(b.kind)))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     entries
+}
+
+fn prompt_agent_rank(agent: AgentKind) -> u8 {
+    match agent {
+        AgentKind::ClaudeCode => 0,
+        AgentKind::Codex => 1,
+    }
+}
+
+fn prompt_kind_rank(kind: PromptKind) -> u8 {
+    match kind {
+        PromptKind::Human => 0,
+        PromptKind::Command => 1,
+        PromptKind::Meta => 2,
+        PromptKind::Sidechain => 3,
+        PromptKind::System => 4,
+        PromptKind::Queued => 5,
+        PromptKind::Sdk => 6,
+        PromptKind::Other => 7,
+    }
 }
 
 fn nearest_cross_source_pairs(items: &[RawPrompt]) -> Vec<Option<usize>> {
@@ -436,14 +512,6 @@ fn make_id(
 
 // ----------------------------- 项目 / 会话聚合 -----------------------------
 
-fn project_name(path: &str) -> String {
-    let trimmed = path.trim_end_matches(|c| c == '/' || c == '\\');
-    match trimmed.rsplit(|c| c == '/' || c == '\\').next() {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => path.to_string(),
-    }
-}
-
 fn aggregate_projects(prompts: &[PromptEntry], conv: &[ConvFileResult]) -> Vec<ProjectInfo> {
     let mut map: HashMap<String, ProjectInfo> = HashMap::new();
     for p in prompts {
@@ -506,7 +574,11 @@ fn aggregate_projects(prompts: &[PromptEntry], conv: &[ConvFileResult]) -> Vec<P
     }
 
     let mut list: Vec<ProjectInfo> = map.into_values().collect();
-    list.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+    list.sort_by(|a, b| {
+        b.last_active
+            .cmp(&a.last_active)
+            .then_with(|| a.path.cmp(&b.path))
+    });
     list
 }
 
@@ -525,7 +597,11 @@ fn build_sessions(conv: &[ConvFileResult]) -> Vec<SessionSummary> {
             git_branch: cr.git_branch.clone(),
         })
         .collect();
-    out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    out.sort_by(|a, b| {
+        b.started_at
+            .cmp(&a.started_at)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
     out
 }
 
@@ -609,7 +685,7 @@ fn compute_stats(
             count,
         })
         .collect();
-    top_projects.sort_by(|a, b| b.count.cmp(&a.count));
+    top_projects.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path)));
     top_projects.truncate(8);
 
     // CC 版本：对话文件 + sessions 元数据
@@ -727,13 +803,16 @@ fn compute_usage(conv: &[ConvFileResult]) -> UsageStats {
         .collect();
     // 已知成本按成本降序；未知成本(None)排最后，按 token 总量降序
     by_model_vec.sort_by(|a, b| match (a.est_cost_usd, b.est_cost_usd) {
-        (Some(x), Some(y)) => y.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(x), Some(y)) => y
+            .partial_cmp(&x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.model.cmp(&b.model)),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => {
             let ta = a.input + a.output + a.cache_read + a.cache_creation;
             let tb = b.input + b.output + b.cache_read + b.cache_creation;
-            tb.cmp(&ta)
+            tb.cmp(&ta).then_with(|| a.model.cmp(&b.model))
         }
     });
 
@@ -766,6 +845,12 @@ fn compute_usage(conv: &[ConvFileResult]) -> UsageStats {
         b.est_cost_usd
             .partial_cmp(&a.est_cost_usd)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let ta = a.input + a.output + a.cache_read + a.cache_creation;
+                let tb = b.input + b.output + b.cache_read + b.cache_creation;
+                tb.cmp(&ta)
+            })
+            .then_with(|| a.path.cmp(&b.path))
     });
     by_project_vec.truncate(8);
 
@@ -784,8 +869,16 @@ fn compute_usage(conv: &[ConvFileResult]) -> UsageStats {
 }
 
 fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let pa: Vec<u32> = a.split('.').map(|s| s.parse().unwrap_or(0)).collect();
-    let pb: Vec<u32> = b.split('.').map(|s| s.parse().unwrap_or(0)).collect();
+    fn parts(v: &str) -> Vec<u32> {
+        v.split('.')
+            .map(|s| {
+                let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse().unwrap_or(0)
+            })
+            .collect()
+    }
+    let pa = parts(a);
+    let pb = parts(b);
     pa.cmp(&pb)
 }
 
@@ -948,13 +1041,20 @@ fn collect_all_conversation_files(paths: &DataPaths) -> Vec<(PathBuf, AgentKind)
     files
 }
 
-fn file_mtime_ms(p: &Path) -> i64 {
-    fs::metadata(p)
+fn file_stamp(p: &Path) -> FileStamp {
+    let Some(meta) = fs::metadata(p).ok() else {
+        return FileStamp { mtime: 0, len: 0 };
+    };
+    let mtime = meta
+        .modified()
         .ok()
-        .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    FileStamp {
+        mtime,
+        len: meta.len(),
+    }
 }
 
 pub fn now_ms() -> i64 {
@@ -1020,6 +1120,7 @@ mod tests {
             first_prompt: String::new(),
             user_prompts: prompts,
             usage_entries: usage,
+            is_subagent: false,
         }
     }
 
@@ -1060,19 +1161,41 @@ mod tests {
         let cache = CacheV2 {
             version: CACHE_VERSION,
             history_path: "/old/.claude/history.jsonl".to_string(),
-            history_mtime: 123,
+            history_stamp: FileStamp {
+                mtime: 123,
+                len: 10,
+            },
             history_prompts: Vec::new(),
             files: HashMap::new(),
         };
         assert!(!history_cache_changed(
             &cache,
             "/old/.claude/history.jsonl",
-            123
+            FileStamp {
+                mtime: 123,
+                len: 10,
+            }
         ));
         assert!(history_cache_changed(
             &cache,
             "/new/.claude/history.jsonl",
-            123
+            FileStamp {
+                mtime: 123,
+                len: 10,
+            }
+        ));
+        assert!(history_cache_changed(
+            &cache,
+            "/old/.claude/history.jsonl",
+            FileStamp {
+                mtime: 123,
+                len: 11,
+            }
+        ));
+        assert!(history_cache_changed(
+            &cache,
+            "/old/.claude/history.jsonl",
+            FileStamp { mtime: 0, len: 10 }
         ));
     }
 
@@ -1158,6 +1281,38 @@ mod tests {
         assert_eq!(entries.len(), 2, "同来源重复输入不能被去重吞掉");
         assert!(entries.iter().all(|e| e.source == "history"));
         assert_ne!(entries[0].id, entries[1].id);
+    }
+
+    #[test]
+    fn merge_dedups_copied_conversation_prompts_by_message_uuid() {
+        let t0 = 1_700_000_000_000i64;
+        let mut original = rp("继续", "/p/a", t0, PromptKind::Human, false, Some("s1"));
+        original.message_uuid = Some("shared-user-uuid".to_string());
+        original.origin_key = "conversation:s1:shared-user-uuid".to_string();
+        let mut copied = rp(
+            "继续",
+            "/p/a",
+            t0 + 5_000,
+            PromptKind::Human,
+            false,
+            Some("s2"),
+        );
+        copied.message_uuid = Some("shared-user-uuid".to_string());
+        copied.origin_key = "conversation:s2:shared-user-uuid".to_string();
+
+        let entries = merge_prompts(
+            vec![],
+            &[
+                cf("s1", Some("/p/a"), vec![original], vec![]),
+                cf("s2", Some("/p/a"), vec![copied], vec![]),
+            ],
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "fork/resume 复制的同一 user uuid 不应重复计数"
+        );
+        assert_eq!(entries[0].message_uuid.as_deref(), Some("shared-user-uuid"));
     }
 
     #[test]
@@ -1248,6 +1403,18 @@ mod tests {
         assert!(kinds.contains(&PromptKind::Command));
     }
 
+    #[test]
+    fn merge_orders_same_timestamp_prompts_deterministically() {
+        let t0 = 1_700_000_000_000i64;
+        let history = vec![
+            rp("z project", "/p/z", t0, PromptKind::Human, true, None),
+            rp("a project", "/p/a", t0, PromptKind::Human, true, None),
+        ];
+        let entries = merge_prompts(history, &[]);
+        let projects: Vec<&str> = entries.iter().map(|e| e.project.as_str()).collect();
+        assert_eq!(projects, vec!["/p/a", "/p/z"]);
+    }
+
     // ---------- search ----------
 
     #[test]
@@ -1275,7 +1442,7 @@ mod tests {
         assert_eq!(r[0].match_ranges, vec![[0, 4]], "重叠区间应合并");
     }
 
-    // ---------- version_cmp / naive_decode ----------
+    // ---------- version_cmp / cache version ----------
 
     #[test]
     fn version_cmp_numeric_parts() {
@@ -1286,13 +1453,16 @@ mod tests {
     }
 
     #[test]
-    fn naive_decode_keeps_encoded_name_as_is() {
-        // 含连字符的目录名不能被错误还原成路径分隔符
+    fn cache_version_precheck_tolerates_spaces() {
         assert_eq!(
-            naive_decode("-Users-xzl-my-project"),
-            "-Users-xzl-my-project"
+            cache_version_from_json(r#"{"version":9,"files":{}}"#),
+            Some(9)
         );
-        assert_eq!(naive_decode(""), "");
+        assert_eq!(
+            cache_version_from_json("{\n  \"version\": 9,\n  \"files\": {}\n}"),
+            Some(9)
+        );
+        assert_eq!(cache_version_from_json(r#"{"files":{}}"#), None);
     }
 
     // ---------- compute_usage ----------
@@ -1329,5 +1499,54 @@ mod tests {
         assert!((pa.est_cost_usd - 15.0).abs() < 1e-9);
         let pb = u.by_project.iter().find(|p| p.path == "/p/b").unwrap();
         assert_eq!(pb.input, 10);
+    }
+
+    #[test]
+    fn usage_dedup_project_assignment_is_stable_after_sorting() {
+        let ts = Local
+            .with_ymd_and_hms(2026, 3, 1, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let usage = ue("msg_shared", "claude-opus-4-1-20250805", ts, 1_000_000, 0);
+        let conv = vec![
+            cf("z-session", Some("/p/z"), vec![], vec![usage.clone()]),
+            cf("a-session", Some("/p/a"), vec![], vec![usage]),
+        ];
+        let mut sorted = conv.clone();
+        sorted.sort_by(|a, b| {
+            a.path
+                .to_string_lossy()
+                .cmp(&b.path.to_string_lossy())
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        let u = compute_usage(&sorted);
+        assert!(
+            u.by_project.iter().any(|p| p.path == "/p/a"),
+            "重复 usage 应稳定归属路径排序最先的会话"
+        );
+        assert!(!u.by_project.iter().any(|p| p.path == "/p/z"));
+    }
+
+    #[test]
+    fn usage_by_model_ties_known_cost_by_model_name() {
+        let ts = Local
+            .with_ymd_and_hms(2026, 3, 1, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let conv = vec![cf(
+            "s1",
+            Some("/p/a"),
+            vec![],
+            vec![
+                ue("msg_1", "claude-sonnet-4-6-20260101", ts, 1_000_000, 0),
+                ue("msg_2", "claude-sonnet-4-5-20260101", ts, 1_000_000, 0),
+            ],
+        )];
+        let u = compute_usage(&conv);
+        let models: Vec<&str> = u.by_model.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(
+            models,
+            vec!["claude-sonnet-4-5-20260101", "claude-sonnet-4-6-20260101"]
+        );
     }
 }

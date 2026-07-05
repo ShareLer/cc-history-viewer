@@ -6,6 +6,7 @@ pub mod models;
 pub mod parser;
 pub mod pricing;
 pub mod state;
+pub mod util;
 
 use state::AppState;
 
@@ -24,6 +25,7 @@ pub fn run() {
             commands::get_conversation,
             commands::get_index_meta,
             commands::refresh_index,
+            commands::rebuild_index,
             commands::get_settings,
             commands::set_settings,
             commands::build_prompt_export,

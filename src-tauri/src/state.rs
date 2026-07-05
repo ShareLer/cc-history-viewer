@@ -11,12 +11,15 @@ use tauri::{AppHandle, Manager};
 pub struct AppState {
     /// 懒加载的索引；首次命令调用时构建。
     pub index: Mutex<Option<AppIndex>>,
+    /// 串行化索引构建与缓存写入，避免 lazy build 与手动刷新并发写同一个缓存文件。
+    pub build_lock: Mutex<()>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             index: Mutex::new(None),
+            build_lock: Mutex::new(()),
         }
     }
 }

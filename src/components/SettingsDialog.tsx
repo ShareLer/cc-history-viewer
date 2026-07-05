@@ -1,6 +1,13 @@
 // 设置弹窗：配置 Claude 数据目录（数据源）。受控组件，无 portal。
 
-import { useEffect, useMemo, useState, type ChangeEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type KeyboardEvent,
+} from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { X } from "lucide-react";
 import { useSettings } from "@/hooks/queries";
@@ -83,6 +90,12 @@ export function SettingsDialog({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedMsg, setSavedMsg] = useState(false);
+  const [rebuilding, setRebuilding] = useState(false);
+  const [rebuildError, setRebuildError] = useState<string | null>(null);
+  const [rebuiltMsg, setRebuiltMsg] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
   // 加载/保存成功后，把表单同步为后端当前值
   useEffect(() => {
@@ -100,9 +113,15 @@ export function SettingsDialog({
   // 每次打开时清掉上次的提示
   useEffect(() => {
     if (open) {
+      previousFocusRef.current = document.activeElement as HTMLElement | null;
       setSaveError(null);
       setSavedMsg(false);
+      setRebuildError(null);
+      setRebuiltMsg(false);
+      requestAnimationFrame(() => closeButtonRef.current?.focus());
+      return;
     }
+    previousFocusRef.current?.focus?.();
   }, [open]);
 
   const dirty = useMemo(() => {
@@ -142,8 +161,51 @@ export function SettingsDialog({
     }
   };
 
+  const handleRebuild = async () => {
+    if (rebuilding) return;
+    setRebuilding(true);
+    setRebuildError(null);
+    setRebuiltMsg(false);
+    try {
+      await api.rebuildIndex();
+      await queryClient.invalidateQueries({
+        predicate: (query) => query.queryKey[0] !== "settings",
+      });
+      setRebuiltMsg(true);
+    } catch (e) {
+      setRebuildError(errMessage(e));
+    } finally {
+      setRebuilding(false);
+    }
+  };
+
+  const handleDialogKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Escape") {
+      e.stopPropagation();
+      onClose();
+      return;
+    }
+    if (e.key !== "Tab") return;
+    const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), summary, [href], [tabindex]:not([tabindex="-1"])'
+    );
+    if (!focusable || focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      onKeyDown={handleDialogKeyDown}
+    >
       {/* 遮罩 */}
       <div
         className="absolute inset-0 bg-black/50"
@@ -152,12 +214,22 @@ export function SettingsDialog({
       />
 
       {/* 卡片 */}
-      <div className="relative max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-xl border border-border bg-surface shadow-2xl">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-dialog-title"
+        className="relative max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-xl border border-border bg-surface shadow-2xl"
+      >
         <div className="flex items-center justify-between border-b border-border px-5 py-3.5">
-          <h2 className="text-sm font-semibold text-foreground">
+          <h2
+            id="settings-dialog-title"
+            className="text-sm font-semibold text-foreground"
+          >
             {t("settingsTitle")}
           </h2>
           <Button
+            ref={closeButtonRef}
             variant="ghost"
             size="icon-sm"
             onClick={onClose}
@@ -247,6 +319,29 @@ export function SettingsDialog({
                 </div>
               )}
 
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2.5">
+                <div className="min-w-0">
+                  <div className="text-xs font-medium text-foreground">
+                    {t("rebuildIndexLabel")}
+                  </div>
+                  <p className="mt-0.5 text-[11px] leading-snug text-muted">
+                    {t("rebuildIndexHint")}
+                  </p>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={handleRebuild}
+                  disabled={rebuilding}
+                >
+                  {rebuilding && (
+                    <Spinner className="border-accent/40 border-t-accent" />
+                  )}
+                  {rebuilding ? t("rebuilding") : t("rebuildIndexButton")}
+                </Button>
+              </div>
+
               {saveError && (
                 <p className="text-xs text-danger">
                   {t("saveFailed", { error: saveError })}
@@ -254,6 +349,14 @@ export function SettingsDialog({
               )}
               {savedMsg && (
                 <p className="text-xs text-success">{t("savedMessage")}</p>
+              )}
+              {rebuildError && (
+                <p className="text-xs text-danger">
+                  {t("rebuildFailed", { error: rebuildError })}
+                </p>
+              )}
+              {rebuiltMsg && (
+                <p className="text-xs text-success">{t("rebuildDone")}</p>
               )}
             </>
           )}

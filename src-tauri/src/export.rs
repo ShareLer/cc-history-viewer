@@ -5,6 +5,7 @@
 use crate::models::{
     AgentKind, ChatMessage, ContentBlock, ConversationDetail, PromptEntry, PromptVisibility,
 };
+use crate::util::project_name;
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use std::collections::{HashMap, HashSet};
 
@@ -379,15 +380,19 @@ pub struct ConversationExportOptions {
     pub include_tools: bool,
     pub include_skills: bool,
     pub include_meta: bool,
+    pub include_codex_commentary: bool,
+    /// 是否包含子代理消息（Agent/Task/spawn_agent 等派发及其结果、sidechain）
+    pub include_subagent: bool,
     pub include_time: bool,
 }
 
 /// 把单个会话的完整对话渲染为 Markdown。
-/// include_thinking / include_tools / include_skills / include_meta / include_time 控制导出内容。
+/// include_thinking / include_tools / include_skills / include_meta /
+/// include_codex_commentary / include_time 控制导出内容。
 /// 一条消息若没有任何可渲染的块则整条跳过。
 pub fn build_conversation_markdown(
     detail: &ConversationDetail,
-    selected_message_uuids: Option<&HashSet<String>>,
+    selected_message_indexes: Option<&HashSet<usize>>,
     options: &ConversationExportOptions,
     lang: Lang,
 ) -> (String, usize) {
@@ -397,13 +402,23 @@ pub fn build_conversation_markdown(
         Lang::En => en,
     };
     let mut rendered_messages: Vec<(String, String)> = Vec::new();
-    for m in &detail.messages {
-        if let Some(selected) = selected_message_uuids {
-            if !selected.contains(&m.uuid) {
+    for (index, m) in detail.messages.iter().enumerate() {
+        if let Some(selected) = selected_message_indexes {
+            if !selected.contains(&index) {
                 continue;
             }
         }
         if m.is_meta && !options.include_meta {
+            continue;
+        }
+        if detail.agent == AgentKind::Codex
+            && m.role == "assistant"
+            && m.phase.as_deref() == Some("commentary")
+            && !options.include_codex_commentary
+        {
+            continue;
+        }
+        if m.is_subagent && !options.include_subagent {
             continue;
         }
         let mut body = String::new();
@@ -414,7 +429,7 @@ pub fn build_conversation_markdown(
             continue; // 整条消息没有可渲染内容（如仅含工具块且未勾选包含工具）
         }
         let who = message_label(m, detail.agent, lang);
-        let side = if m.is_sidechain {
+        let side = if m.is_subagent {
             label("（子代理）", " (subagent)")
         } else {
             ""
@@ -453,12 +468,9 @@ pub fn build_conversation_markdown(
             format!("{} {}", agent_name(detail.agent), v)
         ));
     }
-    md.push_str(&format!(
-        "> **{}**　{} ~ {}\n",
-        label("时间", "Time"),
-        fmt_time(detail.started_at, "%Y-%m-%d %H:%M"),
-        fmt_time(detail.ended_at, "%Y-%m-%d %H:%M"),
-    ));
+    if let Some(range) = conversation_time_range(detail) {
+        md.push_str(&format!("> **{}**　{}\n", label("时间", "Time"), range));
+    }
     md.push_str(&format!(
         "> **{}**　{}\n",
         label("消息数", "Messages"),
@@ -522,13 +534,12 @@ fn render_block(
                 .as_ref()
                 .and_then(|v| serde_json::to_string_pretty(v).ok())
                 .unwrap_or_else(|| "{}".to_string());
-            // 用四个反引号围栏，避免与内容里的 ``` 冲突
-            md.push_str(&format!("````json\n{input}\n````\n\n"));
+            push_fenced(md, Some("json"), &input);
         }
         "tool_result" if options.include_tools => {
             md.push_str(&format!("**{}**\n\n", label("↩ 工具结果", "↩ Tool result")));
             let t = b.text.as_deref().unwrap_or("");
-            md.push_str(&format!("````\n{}\n````\n\n", t.trim()));
+            push_fenced(md, None, t.trim());
         }
         "skill" if options.include_skills => {
             md.push_str(&format!(
@@ -536,7 +547,7 @@ fn render_block(
                 label("🧩 Skill 详情", "🧩 Skill details")
             ));
             if let Some(t) = b.text.as_deref().filter(|t| !t.trim().is_empty()) {
-                md.push_str(&format!("````\n{}\n````\n\n", t.trim()));
+                push_fenced(md, None, t.trim());
             }
         }
         _ => {}
@@ -545,13 +556,71 @@ fn render_block(
 
 fn message_time(m: &ChatMessage, options: &ConversationExportOptions) -> String {
     if options.include_time {
-        format!(" · {}", fmt_time(m.timestamp, "%Y-%m-%d %H:%M"))
+        let time = fmt_time(m.timestamp, "%Y-%m-%d %H:%M");
+        if time.is_empty() {
+            String::new()
+        } else {
+            format!(" · {time}")
+        }
     } else {
         String::new()
     }
 }
 
+fn conversation_time_range(detail: &ConversationDetail) -> Option<String> {
+    let start = fmt_time(detail.started_at, "%Y-%m-%d %H:%M");
+    let end = fmt_time(detail.ended_at, "%Y-%m-%d %H:%M");
+    match (start.is_empty(), end.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(start),
+        (true, false) => Some(end),
+        (false, false) => Some(format!("{start} ~ {end}")),
+    }
+}
+
+fn push_fenced(md: &mut String, lang: Option<&str>, content: &str) {
+    let fence_len = longest_backtick_run(content).saturating_add(1).max(4);
+    let fence = "`".repeat(fence_len);
+    if let Some(lang) = lang {
+        md.push_str(&fence);
+        md.push_str(lang);
+        md.push('\n');
+    } else {
+        md.push_str(&fence);
+        md.push('\n');
+    }
+    md.push_str(content);
+    md.push('\n');
+    md.push_str(&fence);
+    md.push_str("\n\n");
+}
+
+fn longest_backtick_run(content: &str) -> usize {
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for ch in content.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
 fn message_label(m: &ChatMessage, agent: AgentKind, lang: Lang) -> &'static str {
+    if agent == AgentKind::Codex && m.role == "assistant" {
+        if let Some(label) = match (m.phase.as_deref(), lang) {
+            (Some("commentary"), Lang::Zh) => Some("Codex · 中间过程"),
+            (Some("commentary"), Lang::En) => Some("Codex · commentary"),
+            (Some("final_answer"), Lang::Zh) => Some("Codex · 最终回答"),
+            (Some("final_answer"), Lang::En) => Some("Codex · final"),
+            _ => None,
+        } {
+            return label;
+        }
+    }
     match (m.role.as_str(), m.meta_kind.as_deref()) {
         ("user", _) => match lang {
             Lang::Zh if m.is_meta => "⚙ Meta",
@@ -588,6 +657,9 @@ fn agent_name(agent: AgentKind) -> &'static str {
 // ----------------------------- 时间 / 路径工具 -----------------------------
 
 fn fmt_time(ts: i64, fmt: &str) -> String {
+    if ts <= 0 {
+        return String::new();
+    }
     Local
         .timestamp_millis_opt(ts)
         .single()
@@ -601,15 +673,6 @@ fn day_key(ts: i64) -> String {
 
 fn now_label() -> String {
     Local::now().format("%Y-%m-%d %H:%M").to_string()
-}
-
-/// 取路径末级目录名作为展示名。
-fn project_name(path: &str) -> String {
-    let trimmed = path.trim_end_matches(|c| c == '/' || c == '\\');
-    match trimmed.rsplit(|c| c == '/' || c == '\\').next() {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => path.to_string(),
-    }
 }
 
 /// /Users/xxx/... → ~/...
@@ -808,6 +871,8 @@ mod tests {
             include_tools,
             include_skills: false,
             include_meta: false,
+            include_codex_commentary: false,
+            include_subagent: false,
             include_time: false,
         }
     }
@@ -830,6 +895,7 @@ mod tests {
                     call_id: None,
                     timestamp: day_start_ms("2026-05-16").unwrap(),
                     is_sidechain: false,
+                    is_subagent: false,
                     is_meta: false,
                     meta_kind: None,
                     attribution_skill: None,
@@ -842,6 +908,7 @@ mod tests {
                     call_id: None,
                     timestamp: day_start_ms("2026-05-16").unwrap() + 1_000,
                     is_sidechain: false,
+                    is_subagent: false,
                     is_meta: false,
                     meta_kind: None,
                     attribution_skill: None,
@@ -867,6 +934,7 @@ mod tests {
                     call_id: None,
                     timestamp: day_start_ms("2026-05-16").unwrap() + 2_000,
                     is_sidechain: false,
+                    is_subagent: false,
                     is_meta: false,
                     meta_kind: None,
                     attribution_skill: None,
@@ -924,6 +992,7 @@ mod tests {
                     call_id: None,
                     timestamp: day_start_ms("2026-05-16").unwrap(),
                     is_sidechain: false,
+                    is_subagent: false,
                     is_meta: false,
                     meta_kind: None,
                     attribution_skill: None,
@@ -936,6 +1005,7 @@ mod tests {
                     call_id: None,
                     timestamp: day_start_ms("2026-05-16").unwrap() + 1_000,
                     is_sidechain: false,
+                    is_subagent: false,
                     is_meta: true,
                     meta_kind: None,
                     attribution_skill: None,
@@ -949,6 +1019,8 @@ mod tests {
             include_tools: false,
             include_skills: false,
             include_meta: false,
+            include_codex_commentary: false,
+            include_subagent: false,
             include_time: false,
         };
         let (md, count) = build_conversation_markdown(&detail, None, &options, Lang::Zh);
@@ -983,6 +1055,7 @@ mod tests {
                 call_id: None,
                 timestamp: day_start_ms("2026-05-16").unwrap(),
                 is_sidechain: false,
+                is_subagent: false,
                 is_meta: false,
                 meta_kind: None,
                 attribution_skill: None,
@@ -994,6 +1067,8 @@ mod tests {
             include_tools: false,
             include_skills: false,
             include_meta: false,
+            include_codex_commentary: false,
+            include_subagent: false,
             include_time: false,
         };
         let (md, _) = build_conversation_markdown(&detail, None, &options, Lang::Zh);
@@ -1006,5 +1081,197 @@ mod tests {
         };
         let (md, _) = build_conversation_markdown(&detail, None, &options, Lang::Zh);
         assert!(md.contains("## 🧑 用户 · 2026-05-16 00:00\n\n"));
+    }
+
+    #[test]
+    fn conversation_markdown_omits_empty_time_segments() {
+        let detail = ConversationDetail {
+            session_id: "sess-no-time".into(),
+            project: "/p/alpha".into(),
+            agent: AgentKind::Codex,
+            git_branch: None,
+            started_at: 0,
+            ended_at: 0,
+            version: None,
+            messages: vec![ChatMessage {
+                uuid: "u1".into(),
+                role: "user".into(),
+                phase: None,
+                call_id: None,
+                timestamp: 0,
+                is_sidechain: false,
+                is_subagent: false,
+                is_meta: false,
+                meta_kind: None,
+                attribution_skill: None,
+                blocks: vec![text_block("无时间戳")],
+            }],
+        };
+        let options = ConversationExportOptions {
+            include_thinking: false,
+            include_tools: false,
+            include_skills: false,
+            include_meta: false,
+            include_codex_commentary: false,
+            include_subagent: false,
+            include_time: true,
+        };
+        let (md, _) = build_conversation_markdown(&detail, None, &options, Lang::Zh);
+        assert!(md.contains("## 🧑 用户\n\n"));
+        assert!(!md.contains("## 🧑 用户 · "));
+        assert!(!md.contains("> **时间**"));
+        assert!(!md.contains(" ~ "));
+    }
+
+    #[test]
+    fn conversation_markdown_uses_longer_fence_than_tool_output() {
+        let detail = ConversationDetail {
+            session_id: "sess-fence".into(),
+            project: "/p/alpha".into(),
+            agent: AgentKind::ClaudeCode,
+            git_branch: None,
+            started_at: day_start_ms("2026-05-16").unwrap(),
+            ended_at: day_start_ms("2026-05-16").unwrap(),
+            version: None,
+            messages: vec![ChatMessage {
+                uuid: "r1".into(),
+                role: "user".into(),
+                phase: None,
+                call_id: Some("call-1".into()),
+                timestamp: day_start_ms("2026-05-16").unwrap(),
+                is_sidechain: false,
+                is_subagent: false,
+                is_meta: false,
+                meta_kind: None,
+                attribution_skill: None,
+                blocks: vec![ContentBlock {
+                    kind: "tool_result".into(),
+                    text: Some("before\n`````\ninside\n`````\nafter".into()),
+                    tool_name: Some("Bash".into()),
+                    tool_input: None,
+                }],
+            }],
+        };
+        let (md, _) =
+            build_conversation_markdown(&detail, None, &conversation_options(true), Lang::Zh);
+        assert!(md.contains("``````\nbefore\n`````\ninside\n`````\nafter\n``````"));
+    }
+
+    #[test]
+    fn conversation_markdown_respects_codex_commentary() {
+        let detail = ConversationDetail {
+            session_id: "codex:sess".into(),
+            project: "/p/alpha".into(),
+            agent: AgentKind::Codex,
+            git_branch: None,
+            started_at: day_start_ms("2026-05-16").unwrap(),
+            ended_at: day_start_ms("2026-05-16").unwrap(),
+            version: None,
+            messages: vec![
+                ChatMessage {
+                    uuid: "c1".into(),
+                    role: "assistant".into(),
+                    phase: Some("commentary".into()),
+                    call_id: None,
+                    timestamp: day_start_ms("2026-05-16").unwrap(),
+                    is_sidechain: false,
+                    is_subagent: false,
+                    is_meta: false,
+                    meta_kind: None,
+                    attribution_skill: None,
+                    blocks: vec![text_block("中间过程")],
+                },
+                ChatMessage {
+                    uuid: "f1".into(),
+                    role: "assistant".into(),
+                    phase: Some("final_answer".into()),
+                    call_id: None,
+                    timestamp: day_start_ms("2026-05-16").unwrap() + 1_000,
+                    is_sidechain: false,
+                    is_subagent: false,
+                    is_meta: false,
+                    meta_kind: None,
+                    attribution_skill: None,
+                    blocks: vec![text_block("最终回答")],
+                },
+            ],
+        };
+        let options = ConversationExportOptions {
+            include_thinking: false,
+            include_tools: false,
+            include_skills: false,
+            include_meta: false,
+            include_codex_commentary: false,
+            include_subagent: false,
+            include_time: false,
+        };
+        let (md, count) = build_conversation_markdown(&detail, None, &options, Lang::Zh);
+        assert_eq!(count, 1);
+        assert!(!md.contains("中间过程"));
+        assert!(md.contains("Codex · 最终回答"));
+
+        let options = ConversationExportOptions {
+            include_codex_commentary: true,
+            ..options
+        };
+        let (md, count) = build_conversation_markdown(&detail, None, &options, Lang::En);
+        assert_eq!(count, 2);
+        assert!(md.contains("Codex · commentary"));
+        assert!(md.contains("Codex · final"));
+    }
+
+    #[test]
+    fn conversation_markdown_filters_selected_duplicate_uuid_by_index() {
+        let detail = ConversationDetail {
+            session_id: "codex:sess".into(),
+            project: "/p/alpha".into(),
+            agent: AgentKind::Codex,
+            git_branch: None,
+            started_at: day_start_ms("2026-05-16").unwrap(),
+            ended_at: day_start_ms("2026-05-16").unwrap(),
+            version: None,
+            messages: vec![
+                ChatMessage {
+                    uuid: "same-response-id".into(),
+                    role: "assistant".into(),
+                    phase: Some("commentary".into()),
+                    call_id: None,
+                    timestamp: day_start_ms("2026-05-16").unwrap(),
+                    is_sidechain: false,
+                    is_subagent: false,
+                    is_meta: false,
+                    meta_kind: None,
+                    attribution_skill: None,
+                    blocks: vec![text_block("第一条")],
+                },
+                ChatMessage {
+                    uuid: "same-response-id".into(),
+                    role: "assistant".into(),
+                    phase: Some("final_answer".into()),
+                    call_id: None,
+                    timestamp: day_start_ms("2026-05-16").unwrap() + 1_000,
+                    is_sidechain: false,
+                    is_subagent: false,
+                    is_meta: false,
+                    meta_kind: None,
+                    attribution_skill: None,
+                    blocks: vec![text_block("第二条")],
+                },
+            ],
+        };
+        let options = ConversationExportOptions {
+            include_thinking: false,
+            include_tools: false,
+            include_skills: false,
+            include_meta: false,
+            include_codex_commentary: true,
+            include_subagent: false,
+            include_time: false,
+        };
+        let selected = HashSet::from([1usize]);
+        let (md, count) = build_conversation_markdown(&detail, Some(&selected), &options, Lang::Zh);
+        assert_eq!(count, 1);
+        assert!(!md.contains("第一条"));
+        assert!(md.contains("第二条"));
     }
 }

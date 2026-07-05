@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Check, Download, FolderOpen, SearchX } from "lucide-react";
 import { useStore } from "@/store";
 import { useSearch } from "@/hooks/queries";
@@ -7,7 +7,7 @@ import { PromptVisibilityFilters } from "@/components/PromptVisibilityFilters";
 import { Button, CenterMessage, Spinner } from "@/components/ui";
 import { api, errMessage } from "@/lib/api";
 import { getCurrentLang, useT } from "@/i18n";
-import { formatNumber } from "@/lib/utils";
+import { formatNumber, pathBaseName } from "@/lib/utils";
 import type { ExportResult } from "@/lib/types";
 
 export function SearchResults() {
@@ -36,6 +36,11 @@ export function SearchResults() {
   const [exporting, setExporting] = useState(false);
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setExportResult(null);
+    setExportError(null);
+  }, [debouncedQuery, projectFilter, promptVisibility]);
 
   const handleExport = async () => {
     if (!debouncedQuery || exporting) return;
@@ -115,7 +120,7 @@ export function SearchResults() {
               count: formatNumber(exportResult.promptCount),
             })}{" "}
             <span className="font-medium" title={exportResult.path}>
-              {exportResult.path.split("/").pop()}
+              {pathBaseName(exportResult.path)}
             </span>
           </span>
           <button

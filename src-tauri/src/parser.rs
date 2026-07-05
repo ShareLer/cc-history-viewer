@@ -59,6 +59,10 @@ pub struct ConvFileResult {
     pub user_prompts: Vec<RawPrompt>,
     /// assistant 行的 token 用量（文件内已按 dedup_key 去重；跨文件去重在 indexer 完成）
     pub usage_entries: Vec<UsageEntry>,
+    /// 是否为子代理会话文件。Codex 子代理是独立 rollout 文件
+    /// （session_meta.source.subagent），索引装配阶段整体排除，不作为独立会话。
+    /// Claude Code 子代理文件按 subagents/ 目录在文件收集阶段已过滤，此处恒为 false。
+    pub is_subagent: bool,
 }
 
 // ----------------------------- history.jsonl -----------------------------
@@ -134,6 +138,8 @@ struct ConvLine {
     #[serde(rename = "type")]
     line_type: Option<String>,
     uuid: Option<String>,
+    parent_uuid: Option<String>,
+    prompt_id: Option<String>,
     timestamp: Option<String>,
     cwd: Option<String>,
     git_branch: Option<String>,
@@ -152,6 +158,24 @@ struct ConvLine {
     message: Option<ConvMessage>,
     attachment: Option<ConvAttachment>,
     attribution_skill: Option<String>,
+}
+
+struct PendingClaudePrompt {
+    parent_uuid: Option<String>,
+    prompt_id: Option<String>,
+    text: String,
+    origin_key: String,
+    counted: bool,
+    assistant_seen: bool,
+}
+
+struct PendingClaudeDetailUser {
+    parent_uuid: Option<String>,
+    prompt_id: Option<String>,
+    text: String,
+    start: usize,
+    len: usize,
+    assistant_seen: bool,
 }
 
 #[derive(Deserialize)]
@@ -177,8 +201,6 @@ struct ConvAttachment {
     #[serde(rename = "type")]
     attachment_type: Option<String>,
     content: Option<serde_json::Value>,
-    #[serde(rename = "stdout")]
-    _stdout: Option<String>,
     skills: Option<Vec<InvokedSkill>>,
 }
 
@@ -219,6 +241,7 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
     let mut first_any_prompt = String::new();
     let mut user_prompts: Vec<RawPrompt> = Vec::new();
     let mut usage_entries: Vec<UsageEntry> = Vec::new();
+    let mut pending_prompt: Option<PendingClaudePrompt> = None;
     // 文件内去重：同一 API 响应会按内容块拆成多行（message.id 相同、usage 相同），只记一次
     let mut seen_usage_keys: HashSet<String> = HashSet::new();
 
@@ -260,15 +283,31 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
             version = parsed.version.clone();
         }
 
-        if ltype == "user" || ltype == "assistant" {
-            message_count += 1;
-        }
         // assistant 行（含 sidechain，同样计入用量）提取 token 用量
         if ltype == "assistant" {
             if let Some(e) =
                 extract_usage_entry(&parsed, &session_id, line_no, ts, &mut seen_usage_keys)
             {
                 usage_entries.push(e);
+            }
+            let has_visible_answer = parsed
+                .message
+                .as_ref()
+                .and_then(|m| m.content.as_ref())
+                .is_some_and(assistant_content_has_visible_answer);
+            if has_visible_answer {
+                message_count += 1;
+            }
+            if has_visible_answer
+                || parsed
+                    .message
+                    .as_ref()
+                    .and_then(|m| m.content.as_ref())
+                    .is_some_and(assistant_content_has_model_output)
+            {
+                if let Some(pending) = pending_prompt.as_mut() {
+                    pending.assistant_seen = true;
+                }
             }
         }
         if ltype != "user" || too_big {
@@ -293,6 +332,9 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
             None => continue,
         };
         let kind = classify_conversation_prompt_kind(&parsed, content_val);
+        if !matches!(kind, PromptKind::Meta | PromptKind::System) {
+            message_count += 1;
+        }
         let timestamp = match ts {
             Some(t) => t,
             None => continue,
@@ -302,11 +344,35 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("{session_id}:{}", line_no + 1));
+        let origin_key = format!("conversation:{session_id}:{stable_uuid}");
+        let counted = !matches!(kind, PromptKind::Meta | PromptKind::System);
+        if counted
+            && pending_prompt.as_ref().is_some_and(|pending| {
+                is_claude_replay_duplicate(
+                    !pending.assistant_seen,
+                    pending.parent_uuid.as_deref(),
+                    pending.prompt_id.as_deref(),
+                    &pending.text,
+                    parsed.parent_uuid.as_deref(),
+                    parsed.prompt_id.as_deref(),
+                    &prompt_text,
+                )
+            })
+        {
+            if let Some(pending) = pending_prompt.take() {
+                user_prompts.retain(|p| p.origin_key != pending.origin_key);
+                if pending.counted {
+                    message_count = message_count.saturating_sub(1);
+                }
+            }
+        }
+        if first_human_prompt.is_empty() {
+            if let Some(title) = conversation_title_candidate(content_val, kind, &prompt_text) {
+                first_human_prompt = title;
+            }
+        }
         if first_any_prompt.is_empty() {
             first_any_prompt = prompt_text.clone();
-        }
-        if kind == PromptKind::Human && first_human_prompt.is_empty() {
-            first_human_prompt = prompt_text.clone();
         }
         let line_project = parsed
             .cwd
@@ -320,7 +386,7 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
             project: line_project,
             timestamp,
             kind,
-            origin_key: format!("conversation:{session_id}:{stable_uuid}"),
+            origin_key: origin_key.clone(),
             message_uuid: Some(stable_uuid),
             session_id: Some(session_id.clone()),
             git_branch: parsed
@@ -331,6 +397,19 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
             pasted_count: 0,
             from_history: false,
         });
+        if counted {
+            pending_prompt = Some(PendingClaudePrompt {
+                parent_uuid: parsed.parent_uuid.clone(),
+                prompt_id: parsed.prompt_id.clone(),
+                text: user_prompts
+                    .last()
+                    .map(|p| p.text.clone())
+                    .unwrap_or_default(),
+                origin_key,
+                counted,
+                assistant_seen: false,
+            });
+        }
     }
 
     if started_at == i64::MAX {
@@ -368,7 +447,62 @@ pub fn parse_conversation_file(path: &Path) -> Option<ConvFileResult> {
         first_prompt,
         user_prompts,
         usage_entries,
+        // Claude 子代理文件按路径（subagents/）在索引阶段整体排除，走不到这里
+        is_subagent: false,
     })
+}
+
+fn assistant_content_has_visible_answer(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::String(s) => !prettify_display_text(s.trim()).is_empty(),
+        serde_json::Value::Array(arr) => arr.iter().any(|block| {
+            let bt = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match bt {
+                "text" => block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| !prettify_display_text(t).is_empty()),
+                "image" => true,
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
+}
+
+fn assistant_content_has_model_output(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::String(s) => !s.trim().is_empty(),
+        serde_json::Value::Array(arr) => arr.iter().any(|block| {
+            let bt = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            matches!(bt, "text" | "thinking" | "tool_use")
+                || block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.trim().is_empty())
+                || block.get("input").is_some()
+        }),
+        _ => false,
+    }
+}
+
+fn is_claude_replay_duplicate(
+    previous_is_pending: bool,
+    previous_parent_uuid: Option<&str>,
+    previous_prompt_id: Option<&str>,
+    previous_text: &str,
+    current_parent_uuid: Option<&str>,
+    current_prompt_id: Option<&str>,
+    current_text: &str,
+) -> bool {
+    previous_is_pending
+        && previous_parent_uuid.is_some()
+        && previous_parent_uuid == current_parent_uuid
+        && previous_text.trim() == current_text.trim()
+        && match (previous_prompt_id, current_prompt_id) {
+            (Some(a), Some(b)) => a != b,
+            _ => true,
+        }
 }
 
 /// 从 assistant 行提取一条用量记录。
@@ -426,6 +560,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
     let mut started_at = i64::MAX;
     let mut ended_at = i64::MIN;
     let mut messages: Vec<ChatMessage> = Vec::new();
+    let mut pending_user: Option<PendingClaudeDetailUser> = None;
 
     for (line_no, line) in content.lines().enumerate() {
         let line = line.trim();
@@ -482,6 +617,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
                             call_id: None,
                             timestamp: ts.unwrap_or(0),
                             is_sidechain: false,
+                            is_subagent: false,
                             is_meta: parsed.is_meta.unwrap_or(false),
                             meta_kind: Some("command".to_string()),
                             attribution_skill: None,
@@ -507,6 +643,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
                         call_id: None,
                         timestamp: ts.unwrap_or(0),
                         is_sidechain: parsed.is_sidechain.unwrap_or(false),
+                        is_subagent: false,
                         is_meta: parsed.is_meta.unwrap_or(false),
                         meta_kind: Some("skill".to_string()),
                         attribution_skill: None,
@@ -528,6 +665,48 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
         if blocks.is_empty() {
             continue;
         }
+        if ltype == "assistant" {
+            if let Some(pending) = pending_user.as_mut() {
+                pending.assistant_seen = true;
+            }
+        }
+        let replay_user_text = if ltype == "user"
+            && role == "user"
+            && !parsed.is_meta.unwrap_or(false)
+            && !parsed.is_sidechain.unwrap_or(false)
+        {
+            parsed
+                .message
+                .as_ref()
+                .and_then(|m| m.content.as_ref())
+                .and_then(extract_prompt_text)
+        } else {
+            None
+        };
+        if let Some(text) = replay_user_text.as_deref() {
+            if pending_user.as_ref().is_some_and(|pending| {
+                is_claude_replay_duplicate(
+                    !pending.assistant_seen,
+                    pending.parent_uuid.as_deref(),
+                    pending.prompt_id.as_deref(),
+                    &pending.text,
+                    parsed.parent_uuid.as_deref(),
+                    parsed.prompt_id.as_deref(),
+                    text,
+                )
+            }) {
+                if let Some(pending) = pending_user.take() {
+                    let end = pending
+                        .start
+                        .saturating_add(pending.len)
+                        .min(messages.len());
+                    if pending.start < end {
+                        messages.drain(pending.start..end);
+                    }
+                }
+            }
+        }
+        let start_len = messages.len();
         append_claude_messages(
             &mut messages,
             &stable_uuid,
@@ -538,6 +717,19 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
             parsed.attribution_skill.clone(),
             blocks,
         );
+        if let Some(text) = replay_user_text {
+            let added = messages.len().saturating_sub(start_len);
+            if added > 0 {
+                pending_user = Some(PendingClaudeDetailUser {
+                    parent_uuid: parsed.parent_uuid.clone(),
+                    prompt_id: parsed.prompt_id.clone(),
+                    text,
+                    start: start_len,
+                    len: added,
+                    assistant_seen: false,
+                });
+            }
+        }
     }
 
     if started_at == i64::MAX {
@@ -555,7 +747,7 @@ pub fn parse_conversation_detail(path: &Path) -> Option<ConversationDetail> {
         started_at,
         ended_at,
         version,
-        messages: group_tool_results(messages),
+        messages: finalize_conversation_messages(messages),
     })
 }
 
@@ -576,6 +768,8 @@ struct CodexMeta {
     git_branch: Option<String>,
     version: Option<String>,
     model: Option<String>,
+    /// session_meta.source.subagent 存在 → 这是被父会话 spawn 的子代理文件
+    is_subagent: bool,
 }
 
 #[derive(Clone)]
@@ -605,10 +799,11 @@ pub fn parse_codex_session_file(path: &Path) -> Option<ConvFileResult> {
     let mut meta = CodexMeta::default();
     let mut started_at = i64::MAX;
     let mut ended_at = i64::MIN;
-    let mut message_count = 0usize;
+    let mut assistant_message_count = 0usize;
     let mut first_prompt = String::new();
     let mut event_prompts: Vec<CodexUserEvent> = Vec::new();
     let mut fallback_prompts: Vec<CodexUserEvent> = Vec::new();
+    let mut last_compaction_candidate: Option<String> = None;
     let mut usage_entries: Vec<UsageEntry> = Vec::new();
     let mut seen_usage_keys: HashSet<String> = HashSet::new();
 
@@ -646,10 +841,10 @@ pub fn parse_codex_session_file(path: &Path) -> Option<ConvFileResult> {
                             .and_then(|v| v.as_str())
                             .and_then(clean_prompt_text)
                         {
-                            if let Some(t) = ts {
-                                event_prompts.push(CodexUserEvent { timestamp: t, text });
-                                message_count += 1;
-                            }
+                            event_prompts.push(CodexUserEvent {
+                                timestamp: ts.unwrap_or(0),
+                                text,
+                            });
                         }
                     }
                 } else if payload.get("type").and_then(|v| v.as_str()) == Some("task_complete") {
@@ -672,22 +867,33 @@ pub fn parse_codex_session_file(path: &Path) -> Option<ConvFileResult> {
                 if ptype == "message" {
                     match payload.get("role").and_then(|v| v.as_str()).unwrap_or("") {
                         "assistant" => {
-                            // 仅统计最终回答/中间展示消息，developer/system 不属于对话流。
-                            message_count += 1;
+                            if let Some(text) = codex_countable_response_message_text(payload) {
+                                assistant_message_count += 1;
+                                if looks_like_codex_compaction_summary(&text) {
+                                    last_compaction_candidate = Some(text);
+                                }
+                            }
                         }
                         "user" if !too_big => {
                             if let Some(text) = codex_response_message_text(payload)
                                 .and_then(|s| clean_prompt_text(&s))
                             {
                                 if !is_codex_context_injection(&text) {
-                                    if let Some(t) = ts {
-                                        fallback_prompts
-                                            .push(CodexUserEvent { timestamp: t, text });
-                                    }
+                                    fallback_prompts.push(CodexUserEvent {
+                                        timestamp: ts.unwrap_or(0),
+                                        text,
+                                    });
                                 }
                             }
                         }
                         _ => {}
+                    }
+                }
+            }
+            "compacted" => {
+                if let Some(candidate) = last_compaction_candidate.take() {
+                    if codex_compaction_payload_contains_response(payload, &candidate) {
+                        assistant_message_count = assistant_message_count.saturating_sub(1);
                     }
                 }
             }
@@ -697,10 +903,12 @@ pub fn parse_codex_session_file(path: &Path) -> Option<ConvFileResult> {
 
     let session_id = meta.session_id.clone().unwrap_or(file_stem);
     let project = meta.project.clone().unwrap_or_default();
-    let chosen = if event_prompts.is_empty() {
-        fallback_prompts
+    let (chosen, user_message_count) = if event_prompts.is_empty() {
+        let count = fallback_prompts.len();
+        (fallback_prompts, count)
     } else {
-        event_prompts
+        let count = event_prompts.len();
+        (event_prompts, count)
     };
     let mut user_prompts = Vec::new();
     for (idx, p) in chosen.into_iter().enumerate() {
@@ -729,6 +937,7 @@ pub fn parse_codex_session_file(path: &Path) -> Option<ConvFileResult> {
     if ended_at == i64::MIN {
         ended_at = 0;
     }
+    let message_count = user_message_count + assistant_message_count;
 
     Some(ConvFileResult {
         path: path.to_path_buf(),
@@ -743,6 +952,9 @@ pub fn parse_codex_session_file(path: &Path) -> Option<ConvFileResult> {
         first_prompt,
         user_prompts,
         usage_entries,
+        // Codex 子代理是独立 rollout 文件（session_meta.source.subagent）；
+        // 标记后在索引装配阶段整体排除，不作为独立会话展示
+        is_subagent: meta.is_subagent,
     })
 }
 
@@ -758,8 +970,10 @@ pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail
     let mut messages: Vec<ChatMessage> = Vec::new();
     let event_user_prompts = collect_codex_event_user_prompts(&content);
     let mut call_names: HashMap<String, String> = HashMap::new();
+    let mut seen_tool_results: HashSet<(String, String, String)> = HashSet::new();
     let mut event_user_idx = 0usize;
     let mut fallback_user_idx = 0usize;
+    let mut last_compaction_candidate: Option<usize> = None;
 
     for (line_no, line) in content.lines().enumerate() {
         let line = line.trim();
@@ -806,6 +1020,7 @@ pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail
                             call_id: None,
                             timestamp: ts.unwrap_or(0),
                             is_sidechain: false,
+                            is_subagent: false,
                             is_meta: false,
                             meta_kind: None,
                             attribution_skill: None,
@@ -820,7 +1035,7 @@ pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail
                 } else if payload.get("type").and_then(|v| v.as_str()) == Some("web_search_end") {
                     if let Some(msg) = codex_event_tool_result_to_message(payload, &stable_uuid, ts)
                     {
-                        messages.push(msg);
+                        push_unique_tool_result(&mut messages, msg, &mut seen_tool_results);
                     }
                 }
             }
@@ -836,6 +1051,23 @@ pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail
                             .filter_map(|b| b.text.as_deref())
                             .collect::<Vec<_>>()
                             .join("\n");
+                        if is_codex_skill_injection(&text) {
+                            msg.role = "system".to_string();
+                            msg.meta_kind = Some("skill".to_string());
+                            msg.blocks = msg
+                                .blocks
+                                .into_iter()
+                                .map(|mut block| {
+                                    if block.kind == "text" {
+                                        block.kind = "skill".to_string();
+                                        block.tool_name = Some("codex_skill".to_string());
+                                    }
+                                    block
+                                })
+                                .collect();
+                            messages.push(msg);
+                            continue;
+                        }
                         if has_near_codex_event_user(&event_user_prompts, ts, &text)
                             || is_codex_context_injection(&text)
                         {
@@ -848,11 +1080,30 @@ pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail
                             msg.uuid = format!("{raw_session_id}:user:{fallback_user_idx}");
                         }
                     }
-                    messages.push(msg);
+                    let is_compaction_candidate = msg.role == "assistant"
+                        && msg.phase.as_deref() == Some("final_answer")
+                        && msg.blocks.iter().any(|b| {
+                            b.kind == "text"
+                                && b.text
+                                    .as_deref()
+                                    .is_some_and(looks_like_codex_compaction_summary)
+                        });
+                    if is_tool_result_message(&msg) {
+                        push_unique_tool_result(&mut messages, msg, &mut seen_tool_results);
+                    } else {
+                        messages.push(msg);
+                    }
+                    if is_compaction_candidate {
+                        last_compaction_candidate = Some(messages.len().saturating_sub(1));
+                    }
                 }
             }
             "compacted" => {
-                remove_codex_compaction_summary(&mut messages, payload);
+                remove_codex_compaction_summary(
+                    &mut messages,
+                    payload,
+                    &mut last_compaction_candidate,
+                );
             }
             _ => {}
         }
@@ -873,29 +1124,31 @@ pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail
         started_at,
         ended_at,
         version: meta.version,
-        messages: group_tool_results(messages),
+        messages: finalize_conversation_messages(messages),
     })
 }
 
-fn remove_codex_compaction_summary(messages: &mut Vec<ChatMessage>, payload: &serde_json::Value) {
-    let compacted_text = payload
-        .get("message")
-        .and_then(|v| v.as_str())
-        .or_else(|| payload.get("summary").and_then(|v| v.as_str()))
-        .or_else(|| payload.as_str())
-        .unwrap_or("")
-        .trim();
-    let Some(last) = messages.last() else {
-        return;
-    };
-    if last.role != "assistant" || last.phase.as_deref() != Some("final_answer") {
+fn remove_codex_compaction_summary(
+    messages: &mut Vec<ChatMessage>,
+    payload: &serde_json::Value,
+    last_candidate: &mut Option<usize>,
+) {
+    let compacted_text = codex_compaction_payload_text(payload);
+    if compacted_text.is_empty() {
         return;
     }
-    let last_text = message_text(last);
-    if compaction_payload_contains_message(compacted_text, &last_text)
-        || looks_like_codex_compaction_summary(&last_text)
-    {
-        messages.pop();
+    let Some(idx) = last_candidate.take() else {
+        return;
+    };
+    let Some(candidate) = messages.get(idx) else {
+        return;
+    };
+    if candidate.role != "assistant" || candidate.phase.as_deref() != Some("final_answer") {
+        return;
+    }
+    let candidate_text = message_text(candidate);
+    if codex_compaction_payload_contains_response(payload, &candidate_text) {
+        messages.remove(idx);
     }
 }
 
@@ -911,14 +1164,80 @@ fn compaction_payload_contains_message(compacted_text: &str, message: &str) -> b
     prefix.len() >= 40 && compacted_text.contains(prefix.trim())
 }
 
+fn codex_compaction_payload_text(payload: &serde_json::Value) -> String {
+    payload
+        .get("message")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("summary").and_then(|v| v.as_str()))
+        .or_else(|| payload.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn codex_compaction_payload_contains_response(
+    payload: &serde_json::Value,
+    candidate_text: &str,
+) -> bool {
+    let compacted_text = codex_compaction_payload_text(payload);
+    !compacted_text.is_empty()
+        && looks_like_codex_compaction_summary(candidate_text)
+        && compaction_payload_contains_message(&compacted_text, candidate_text)
+}
+
 fn looks_like_codex_compaction_summary(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("**Task Context**")
         || trimmed.starts_with("**Task state**")
         || trimmed.starts_with("**Workspace / User Goal**")
         || trimmed.starts_with("**Handoff Summary**")
+        || trimmed.starts_with("## Handoff Summary")
+        || trimmed.starts_with("**Checkpoint Summary**")
+        || trimmed.starts_with("**任务背景**")
         || trimmed.starts_with("- User request:")
         || trimmed.starts_with("- User asked:")
+        || (trimmed.starts_with("We are in ") && trimmed.contains("User asked"))
+}
+
+fn codex_countable_response_message_text(payload: &serde_json::Value) -> Option<String> {
+    if payload.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+        return None;
+    }
+    if payload.get("phase").and_then(|v| v.as_str()) == Some("commentary") {
+        return None;
+    }
+    codex_response_message_text(payload).filter(|text| !text.trim().is_empty())
+}
+
+fn push_unique_tool_result(
+    messages: &mut Vec<ChatMessage>,
+    msg: ChatMessage,
+    seen: &mut HashSet<(String, String, String)>,
+) {
+    let Some(call_id) = msg.call_id.clone() else {
+        messages.push(msg);
+        return;
+    };
+    if !is_tool_result_message(&msg) {
+        messages.push(msg);
+        return;
+    }
+    let tool_name = msg
+        .blocks
+        .iter()
+        .find(|b| b.kind == "tool_result")
+        .and_then(|b| b.tool_name.clone())
+        .unwrap_or_default();
+    let text = msg
+        .blocks
+        .iter()
+        .filter(|b| b.kind == "tool_result")
+        .filter_map(|b| b.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if seen.insert((call_id, tool_name, text)) {
+        messages.push(msg);
+    }
 }
 
 fn group_tool_results(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
@@ -974,6 +1293,56 @@ fn is_tool_result_message(msg: &ChatMessage) -> bool {
     msg.blocks.iter().any(|b| b.kind == "tool_result")
 }
 
+/// 子代理派发工具名。命中这些工具的调用消息（及其配对结果）标记为子代理。
+/// - Claude Code：`Agent`（新版）/ `Task`（旧版）；
+/// - Codex：`multi_agent_v1` 命名空间的 `spawn_agent` / `wait_agent` / `close_agent`。
+fn is_subagent_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Agent" | "Task" | "spawn_agent" | "wait_agent" | "close_agent"
+    )
+}
+
+/// 对话详情的收尾处理：先按 call_id 把工具结果排到调用之后，再标记子代理消息。
+/// 两个详情解析器（Claude / Codex）共用此出口，保证行为一致。
+fn finalize_conversation_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut ordered = group_tool_results(messages);
+    mark_subagent_messages(&mut ordered);
+    ordered
+}
+
+/// 标记子代理相关消息，供前端 / 导出用独立开关控制显隐：
+/// - 任何 sidechain 消息（Claude 旧版把子代理消息混在同一文件里）；
+/// - 子代理派发工具的调用消息；
+/// - 上述调用按 call_id 配对的结果消息。
+/// 不改变消息顺序，只翻转 `is_subagent` 标记。
+fn mark_subagent_messages(messages: &mut [ChatMessage]) {
+    let mut subagent_call_ids: HashSet<String> = HashSet::new();
+    for msg in messages.iter() {
+        let is_subagent_call = msg.blocks.iter().any(|b| {
+            b.kind == "tool_use" && b.tool_name.as_deref().is_some_and(is_subagent_tool_name)
+        });
+        if is_subagent_call {
+            if let Some(call_id) = msg.call_id.as_deref() {
+                subagent_call_ids.insert(call_id.to_string());
+            }
+        }
+    }
+    for msg in messages.iter_mut() {
+        let hit = msg.is_sidechain
+            || msg.blocks.iter().any(|b| {
+                b.kind == "tool_use" && b.tool_name.as_deref().is_some_and(is_subagent_tool_name)
+            })
+            || msg
+                .call_id
+                .as_deref()
+                .is_some_and(|c| subagent_call_ids.contains(c));
+        if hit {
+            msg.is_subagent = true;
+        }
+    }
+}
+
 fn message_text(msg: &ChatMessage) -> String {
     msg.blocks
         .iter()
@@ -1021,6 +1390,14 @@ fn apply_codex_session_meta(payload: &serde_json::Value, meta: &mut CodexMeta) {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
     }
+    // source.subagent 标识本文件是父会话 spawn 出来的子代理，不作为独立会话索引
+    if payload
+        .get("source")
+        .and_then(|v| v.get("subagent"))
+        .is_some()
+    {
+        meta.is_subagent = true;
+    }
 }
 
 fn apply_codex_turn_context(payload: &serde_json::Value, meta: &mut CodexMeta) {
@@ -1049,8 +1426,7 @@ fn extract_codex_usage_entry(
     seen: &mut HashSet<String>,
 ) -> Option<UsageEntry> {
     let info = payload.get("info")?;
-    let total = info.get("total_token_usage")?;
-    let last = info.get("last_token_usage").unwrap_or(total);
+    let last = info.get("last_token_usage").filter(|v| v.is_object())?;
     let input = last
         .get("input_tokens")
         .and_then(|v| v.as_u64())
@@ -1109,6 +1485,7 @@ fn codex_event_tool_result_to_message(
         call_id: Some(call_id.to_string()),
         timestamp: ts.unwrap_or(0),
         is_sidechain: false,
+        is_subagent: false,
         is_meta: false,
         meta_kind: None,
         attribution_skill: None,
@@ -1149,6 +1526,7 @@ fn codex_response_item_to_message(
                 call_id: None,
                 timestamp: ts.unwrap_or(0),
                 is_sidechain: false,
+                is_subagent: false,
                 is_meta: false,
                 meta_kind: None,
                 attribution_skill: None,
@@ -1167,6 +1545,7 @@ fn codex_response_item_to_message(
                 call_id: None,
                 timestamp: ts.unwrap_or(0),
                 is_sidechain: false,
+                is_subagent: false,
                 is_meta: false,
                 meta_kind: None,
                 attribution_skill: None,
@@ -1192,6 +1571,7 @@ fn codex_response_item_to_message(
                 call_id: Some(call_id.to_string()),
                 timestamp: ts.unwrap_or(0),
                 is_sidechain: false,
+                is_subagent: false,
                 is_meta: false,
                 meta_kind: None,
                 attribution_skill: None,
@@ -1223,6 +1603,7 @@ fn codex_response_item_to_message(
                 call_id: Some(call_id.to_string()),
                 timestamp: ts.unwrap_or(0),
                 is_sidechain: false,
+                is_subagent: false,
                 is_meta: false,
                 meta_kind: None,
                 attribution_skill: None,
@@ -1390,34 +1771,38 @@ fn collect_codex_event_user_prompts(content: &str) -> Vec<CodexUserEvent> {
         else {
             continue;
         };
-        let Some(timestamp) = parsed.timestamp.as_deref().and_then(iso_to_ms) else {
-            continue;
-        };
+        let timestamp = parsed.timestamp.as_deref().and_then(iso_to_ms).unwrap_or(0);
         out.push(CodexUserEvent { timestamp, text });
     }
     out
 }
 
 fn has_near_codex_event_user(events: &[CodexUserEvent], ts: Option<i64>, text: &str) -> bool {
-    let Some(ts) = ts else {
-        return false;
-    };
     let text = text.trim();
-    events
-        .iter()
-        .any(|e| e.text.trim() == text && e.timestamp.abs_diff(ts) <= 5_000)
+    let ts = ts.unwrap_or(0);
+    events.iter().any(|e| {
+        e.text.trim() == text && (e.timestamp == 0 || ts == 0 || e.timestamp.abs_diff(ts) <= 5_000)
+    })
 }
 
 fn is_codex_context_injection(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("# AGENTS.md instructions")
+        || is_codex_skill_injection(trimmed)
         || trimmed.starts_with("<environment_context>")
         || trimmed.starts_with("<permissions instructions>")
         || trimmed.starts_with("<app-context>")
         || trimmed.starts_with("<collaboration_mode>")
         || trimmed.starts_with("<skills_instructions>")
         || trimmed.starts_with("<plugins_instructions>")
+        || trimmed.starts_with("<turn_aborted>")
+        || trimmed.starts_with("<subagent_notification>")
         || trimmed.starts_with("[system]")
+}
+
+fn is_codex_skill_injection(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("<skill>") && trimmed.contains("</skill>") && trimmed.contains("<name>")
 }
 
 fn skill_attachment_blocks(attachment: Option<&ConvAttachment>) -> Option<Vec<ContentBlock>> {
@@ -1557,7 +1942,7 @@ fn is_meta_like_text(raw: &str) -> bool {
 }
 
 fn is_command_wrapper_text(raw: &str) -> bool {
-    raw.contains("<command-name>")
+    command_wrapper_parts(raw).is_some()
 }
 
 fn looks_like_command_text(raw: &str) -> bool {
@@ -1593,6 +1978,44 @@ fn is_path_like_slash_text(raw: &str) -> bool {
     }
     let token = first_line.split_whitespace().next().unwrap_or("");
     token.len() > 1 && token[1..].contains('/')
+}
+
+fn conversation_title_candidate(
+    content: &serde_json::Value,
+    kind: PromptKind,
+    prompt_text: &str,
+) -> Option<String> {
+    if matches!(
+        kind,
+        PromptKind::Meta | PromptKind::System | PromptKind::Sidechain
+    ) {
+        return None;
+    }
+    let raw = prompt_classification_text(content).unwrap_or_default();
+    if let Some((_name, args)) = command_wrapper_parts(&raw) {
+        return non_empty_title(&normalize_image_placeholders(args.trim()));
+    }
+    if kind == PromptKind::Command {
+        return slash_command_args_title(prompt_text);
+    }
+    non_empty_title(prompt_text)
+}
+
+fn slash_command_args_title(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if !looks_like_command_text(trimmed) {
+        return non_empty_title(trimmed);
+    }
+    let rest = trimmed
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or("");
+    non_empty_title(rest)
+}
+
+fn non_empty_title(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// 从 user 消息 content 提取可作为 prompt 的纯文本
@@ -1647,12 +2070,10 @@ fn clean_prompt_text(raw: &str) -> Option<String> {
     // 斜杠命令：<command-name>/foo</command-name>...
     // 自定义命令的参数在 <command-args> 里，要一并保留——
     // 否则与 history.jsonl 中「/foo 参数」形式的同一条 prompt 无法去重合并。
-    if let Some(name) = extract_between(trimmed, "<command-name>", "</command-name>") {
+    if let Some((name, args)) = command_wrapper_parts(trimmed) {
         let n = name.trim();
         if !n.is_empty() {
-            let args = extract_between(trimmed, "<command-args>", "</command-args>")
-                .map(|a| a.trim().to_string())
-                .unwrap_or_default();
+            let args = args.trim();
             return Some(if args.is_empty() {
                 n.to_string()
             } else {
@@ -1663,9 +2084,6 @@ fn clean_prompt_text(raw: &str) -> Option<String> {
     // 去掉系统提示与命令相关包裹标签
     let mut s = strip_tag_blocks(trimmed, "system-reminder");
     s = strip_tag_blocks(&s, "local-command-caveat");
-    s = strip_tag_blocks(&s, "command-message");
-    s = strip_tag_blocks(&s, "command-args");
-    s = strip_tag_blocks(&s, "command-name");
     s = strip_tag_blocks(&s, "command-stdout");
     let s = normalize_image_placeholders(s.trim());
     let s = s.trim();
@@ -1741,24 +2159,36 @@ fn extract_between(s: &str, open: &str, close: &str) -> Option<String> {
     Some(s[start..start + rel_end].to_string())
 }
 
+fn command_wrapper_parts(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if !trimmed.contains("<command-name>") {
+        return None;
+    }
+    let name = extract_between(trimmed, "<command-name>", "</command-name>")?;
+    let mut rest = strip_tag_blocks(trimmed, "command-name");
+    rest = strip_tag_blocks(&rest, "command-message");
+    rest = strip_tag_blocks(&rest, "command-args");
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    let args = extract_between(trimmed, "<command-args>", "</command-args>").unwrap_or_default();
+    Some((name, args))
+}
+
 /// 对话详情展示用的文本美化：
 /// - `<command-name>/foo</command-name>...<command-args>bar</command-args>` → "/foo bar"
 /// - 剥离 local-command-caveat 包裹块
 /// 仅影响展示（parse_conversation_detail 不参与缓存），不改变索引/搜索的数据。
 fn prettify_display_text(s: &str) -> String {
-    if s.contains("<command-name>") {
-        if let Some(name) = extract_between(s, "<command-name>", "</command-name>") {
-            let n = name.trim();
-            if !n.is_empty() {
-                let args = extract_between(s, "<command-args>", "</command-args>")
-                    .map(|a| a.trim().to_string())
-                    .unwrap_or_default();
-                return if args.is_empty() {
-                    n.to_string()
-                } else {
-                    format!("{n} {args}")
-                };
-            }
+    if let Some((name, args)) = command_wrapper_parts(s) {
+        let n = name.trim();
+        if !n.is_empty() {
+            let args = args.trim();
+            return if args.is_empty() {
+                n.to_string()
+            } else {
+                format!("{n} {args}")
+            };
         }
     }
     strip_tag_blocks(s, "local-command-caveat")
@@ -1807,6 +2237,7 @@ fn append_claude_messages(
             call_id: None,
             timestamp,
             is_sidechain,
+            is_subagent: false,
             is_meta,
             meta_kind: None,
             attribution_skill: attribution_skill.clone(),
@@ -1825,6 +2256,7 @@ fn append_claude_messages(
                 call_id: parsed.call_id,
                 timestamp,
                 is_sidechain,
+                is_subagent: false,
                 is_meta,
                 meta_kind: None,
                 attribution_skill: attribution_skill.clone(),
@@ -1991,6 +2423,19 @@ mod tests {
     }
 
     #[test]
+    fn embedded_command_wrapper_example_is_not_rewritten_as_command() {
+        let raw = r#"{
+  "message": {
+    "content": "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>"
+  }
+}
+这三条有什么区别？"#;
+        assert_eq!(clean_prompt_text(raw), Some(raw.to_string()));
+        assert_eq!(prettify_display_text(raw), raw.to_string());
+        assert_eq!(classify_history_prompt_kind(raw), PromptKind::Human);
+    }
+
+    #[test]
     fn clean_strips_system_reminder_keeps_text() {
         let raw = "前文<system-reminder>注入的噪音</system-reminder>后文";
         assert_eq!(clean_prompt_text(raw), Some("前文后文".to_string()));
@@ -2109,6 +2554,24 @@ mod tests {
                 }
             }),
             json!({
+                "timestamp": "2026-07-04T00:00:02.600Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "summary1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "**Handoff Summary**\n- User request: x"}],
+                    "phase": "final_answer"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:02.700Z",
+                "type": "compacted",
+                "payload": {
+                    "message": "**Handoff Summary**\n- User request: x"
+                }
+            }),
+            json!({
                 "timestamp": "2026-07-04T00:00:03.000Z",
                 "type": "response_item",
                 "payload": {
@@ -2168,6 +2631,15 @@ mod tests {
                 }
             }),
             json!({
+                "timestamp": "2026-07-04T00:00:04.350Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "web_search_end",
+                    "call_id": "web1",
+                    "query": "Claude Code history"
+                }
+            }),
+            json!({
                 "timestamp": "2026-07-04T00:00:04.500Z",
                 "type": "response_item",
                 "payload": {
@@ -2210,6 +2682,7 @@ mod tests {
         assert_eq!(parsed.project.as_deref(), Some("/tmp/proj"));
         assert_eq!(parsed.git_branch.as_deref(), Some("main"));
         assert_eq!(parsed.first_prompt, "真实问题");
+        assert_eq!(parsed.message_count, 3);
         assert_eq!(parsed.user_prompts.len(), 1);
         assert_eq!(parsed.user_prompts[0].text, "真实问题");
         assert_eq!(parsed.usage_entries.len(), 1);
@@ -2230,15 +2703,18 @@ mod tests {
         );
         assert!(detail.messages.iter().any(|m| m.role == "assistant"
             && m.phase.as_deref() == Some("final_answer")
+            && m.blocks.iter().any(|b| b.text.as_deref() == Some("回答"))));
+        assert!(detail.messages.iter().any(|m| m.role == "assistant"
+            && m.phase.as_deref() == Some("final_answer")
             && m.blocks
                 .iter()
                 .any(|b| b.text.as_deref() == Some("真实最终回答"))));
         assert!(
-            !detail
-                .messages
-                .iter()
-                .any(|m| m.blocks.iter().any(|b| b.text.as_deref() == Some("回答"))),
-            "compacted 前置摘要不应作为最终回答展示"
+            !detail.messages.iter().any(|m| m.blocks.iter().any(|b| b
+                .text
+                .as_deref()
+                .is_some_and(|t| t.starts_with("**Handoff Summary**")))),
+            "compaction 生成的 handoff 摘要不应作为最终回答展示"
         );
         assert!(detail
             .messages
@@ -2265,6 +2741,388 @@ mod tests {
                 Some("web1")
             ]
         );
+        assert_eq!(
+            detail
+                .messages
+                .iter()
+                .filter(|m| m.call_id.as_deref() == Some("web1")
+                    && m.blocks.iter().any(|b| b.kind == "tool_result"))
+                .count(),
+            1,
+            "event_msg 与 response_item 同时出现 web_search_end 时应去重"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn codex_fallback_user_counts_and_usage_requires_last_token_usage() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc_history_viewer_codex_fallback_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("fallback.jsonl");
+        let jsonl = [
+            json!({
+                "timestamp": "2026-07-04T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"session_id": "fallback", "cwd": "/tmp/proj"}
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "fallback prompt"}]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:02.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                    "phase": "final_answer"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 10,
+                            "output_tokens": 20
+                        }
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let parsed = parse_codex_session_file(&path).unwrap();
+        assert_eq!(parsed.user_prompts.len(), 1);
+        assert_eq!(parsed.message_count, 2);
+        assert!(parsed.usage_entries.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn codex_timestampless_event_user_is_indexed_and_rendered() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc_history_viewer_codex_no_ts_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("no-ts.jsonl");
+        let jsonl = [
+            json!({
+                "timestamp": "2026-07-04T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"session_id": "no-ts", "cwd": "/tmp/proj"}
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "无时间戳问题", "images": []}
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "无时间戳问题"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let parsed = parse_codex_session_file(&path).unwrap();
+        assert_eq!(parsed.user_prompts.len(), 1);
+        assert_eq!(parsed.user_prompts[0].timestamp, 0);
+        assert_eq!(parsed.first_prompt, "无时间戳问题");
+        assert_eq!(parsed.message_count, 1);
+
+        let detail = parse_codex_conversation_detail(&path).unwrap();
+        assert_eq!(
+            detail
+                .messages
+                .iter()
+                .filter(|m| m.role == "user" && m.blocks.iter().any(|b| b.kind == "text"))
+                .count(),
+            1
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn codex_fallback_preserves_user_angle_tag_prompts() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc_history_viewer_codex_angle_tag_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("angle-tag.jsonl");
+        let jsonl = [
+            json!({
+                "timestamp": "2026-07-04T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"session_id": "angle-tag", "cwd": "/tmp/proj"}
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "<my_tag>\n请分析这个占位符"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let parsed = parse_codex_session_file(&path).unwrap();
+        assert_eq!(parsed.user_prompts.len(), 1);
+        assert_eq!(parsed.first_prompt, "<my_tag>\n请分析这个占位符");
+        assert_eq!(parsed.message_count, 1);
+
+        let detail = parse_codex_conversation_detail(&path).unwrap();
+        assert!(detail.messages.iter().any(|m| {
+            m.role == "user"
+                && m.blocks
+                    .iter()
+                    .any(|b| b.text.as_deref() == Some("<my_tag>\n请分析这个占位符"))
+        }));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn codex_preserves_embedded_command_wrapper_examples() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc_history_viewer_codex_embedded_command_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("embedded-command.jsonl");
+        let user_text = "{\n  \"message\": {\n    \"content\": \"<command-name>/model</command-name>\\n<command-message>model</command-message>\\n<command-args></command-args>\"\n  }\n}\n这三个有什么区别？";
+        let answer_text = "这三条的本质区别不是 `type=user`。\n\n```xml\n<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>\n```";
+        let jsonl = [
+            json!({
+                "timestamp": "2026-07-05T14:06:28.039Z",
+                "type": "session_meta",
+                "payload": {"session_id": "embedded-command", "cwd": "/tmp/proj"}
+            }),
+            json!({
+                "timestamp": "2026-07-05T14:06:28.557Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_text}]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-05T14:06:28.558Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": user_text, "images": []}
+            }),
+            json!({
+                "timestamp": "2026-07-05T14:07:43.435Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "answer",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": answer_text}],
+                    "phase": "final_answer"
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let parsed = parse_codex_session_file(&path).unwrap();
+        assert_eq!(parsed.user_prompts.len(), 1);
+        assert_eq!(parsed.first_prompt, user_text);
+        assert_ne!(parsed.first_prompt, "/model");
+
+        let detail = parse_codex_conversation_detail(&path).unwrap();
+        assert!(detail.messages.iter().any(|m| {
+            m.role == "user"
+                && m.blocks
+                    .iter()
+                    .any(|b| b.text.as_deref() == Some(user_text))
+        }));
+        assert!(detail.messages.iter().any(|m| {
+            m.role == "assistant"
+                && m.blocks
+                    .iter()
+                    .any(|b| b.text.as_deref() == Some(answer_text))
+        }));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn codex_skill_injection_and_compaction_summary_are_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc_history_viewer_codex_meta_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("meta.jsonl");
+        let compacted_summary = "We are in `/tmp/proj`. User asked in Chinese: “再次进行深度review”. Need continue from current state.";
+        let checkpoint_summary = "**Checkpoint Summary**\n\n**Progress / Decisions**\n- done";
+        let jsonl = [
+            json!({
+                "timestamp": "2026-07-04T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"session_id": "meta", "cwd": "/tmp/proj"}
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:00.100Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "<skill>\n<name>requesting-code-review</name>\n<path>/tmp/SKILL.md</path>\n---\n# Skill body\n</skill>"}]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "真实问题"}]
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:01.000Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "真实问题", "images": []}
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:02.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "summary1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": compacted_summary}],
+                    "phase": "final_answer"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:02.100Z",
+                "type": "compacted",
+                "payload": {
+                    "message": format!("Another language model started to solve this problem.\n{compacted_summary}")
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:02.200Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "summary2",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": checkpoint_summary}],
+                    "phase": "final_answer"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:02.300Z",
+                "type": "compacted",
+                "payload": {
+                    "message": format!("Another language model started to solve this problem.\n{checkpoint_summary}")
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:03.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "answer",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "真实回答"}],
+                    "phase": "final_answer"
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let parsed = parse_codex_session_file(&path).unwrap();
+        assert_eq!(parsed.user_prompts.len(), 1);
+        assert_eq!(parsed.first_prompt, "真实问题");
+        assert_eq!(parsed.message_count, 2);
+
+        let detail = parse_codex_conversation_detail(&path).unwrap();
+        assert_eq!(
+            detail
+                .messages
+                .iter()
+                .filter(|m| m.role == "user" && m.blocks.iter().any(|b| b.kind == "text"))
+                .count(),
+            1
+        );
+        assert!(detail.messages.iter().any(|m| {
+            m.role == "system"
+                && m.meta_kind.as_deref() == Some("skill")
+                && m.blocks.iter().any(|b| b.kind == "skill")
+        }));
+        assert!(
+            !detail
+                .messages
+                .iter()
+                .any(|m| message_text(m).contains("User asked in Chinese")),
+            "compaction summary should not be shown as a final answer"
+        );
+        assert!(
+            !detail
+                .messages
+                .iter()
+                .any(|m| message_text(m).starts_with("**Checkpoint Summary**")),
+            "checkpoint summary should not be shown as a final answer"
+        );
+        assert!(detail.messages.iter().any(|m| {
+            m.role == "assistant"
+                && m.phase.as_deref() == Some("final_answer")
+                && m.blocks
+                    .iter()
+                    .any(|b| b.text.as_deref() == Some("真实回答"))
+        }));
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -2285,6 +3143,8 @@ mod tests {
         let line = ConvLine {
             line_type: Some("user".to_string()),
             uuid: None,
+            parent_uuid: None,
+            prompt_id: None,
             timestamp: None,
             cwd: None,
             git_branch: None,
@@ -2325,6 +3185,8 @@ mod tests {
         let line = ConvLine {
             line_type: Some("user".to_string()),
             uuid: None,
+            parent_uuid: None,
+            prompt_id: None,
             timestamp: None,
             cwd: None,
             git_branch: None,
@@ -2350,6 +3212,248 @@ mod tests {
             classify_conversation_prompt_kind(&line, line.content.as_ref().unwrap()),
             PromptKind::Command
         );
+    }
+
+    #[test]
+    fn claude_session_title_skips_control_command_and_uses_command_args() {
+        let path = std::env::temp_dir().join(format!(
+            "cc_history_viewer_claude_title_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real_prompt = "对当前代码仓库进行一次深度的review\n主要是检查解析逻辑是否全面且准确";
+        let jsonl = [
+            json!({
+                "type": "user",
+                "uuid": "model-command",
+                "timestamp": "2026-07-05T00:28:56.723Z",
+                "cwd": "/tmp/project",
+                "message": {
+                    "role": "user",
+                    "content": "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>"
+                }
+            }),
+            json!({
+                "type": "user",
+                "uuid": "model-output",
+                "timestamp": "2026-07-05T00:28:56.723Z",
+                "cwd": "/tmp/project",
+                "message": {
+                    "role": "user",
+                    "content": "<local-command-stdout>Set model to dpsk-model and saved as your default for new sessions</local-command-stdout>"
+                }
+            }),
+            json!({
+                "type": "user",
+                "uuid": "review-command",
+                "timestamp": "2026-07-05T00:29:12.043Z",
+                "cwd": "/tmp/project",
+                "message": {
+                    "role": "user",
+                    "content": format!("<command-message>superpowers:requesting-code-review</command-message>\n<command-name>/superpowers:requesting-code-review</command-name>\n<command-args>{real_prompt}</command-args>")
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let parsed = parse_conversation_file(&path).expect("fixture 应能解析");
+        assert_eq!(parsed.first_prompt, real_prompt);
+        assert_eq!(parsed.message_count, 2);
+        assert_eq!(parsed.user_prompts.len(), 2);
+        assert_eq!(parsed.user_prompts[0].text, "/model");
+        assert_eq!(
+            parsed.user_prompts[1].text,
+            format!("/superpowers:requesting-code-review {real_prompt}")
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claude_replay_user_prompt_is_removed_from_summary_and_detail() {
+        let path = std::env::temp_dir().join(format!(
+            "cc_history_viewer_claude_replay_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real_prompt = "对当前代码仓库进行一次深度的review";
+        let wrapped = format!(
+            "<command-message>superpowers:requesting-code-review</command-message>\n<command-name>/superpowers:requesting-code-review</command-name>\n<command-args>{real_prompt}</command-args>"
+        );
+        let jsonl = [
+            json!({
+                "type": "user",
+                "uuid": "first-replay",
+                "parentUuid": "same-parent",
+                "promptId": "prompt-preflight",
+                "timestamp": "2026-07-05T01:30:48.409Z",
+                "cwd": "/tmp/project",
+                "message": {"role": "user", "content": wrapped}
+            }),
+            json!({
+                "type": "user",
+                "uuid": "skill-meta",
+                "parentUuid": "first-replay",
+                "promptId": "prompt-preflight",
+                "timestamp": "2026-07-05T01:30:49.000Z",
+                "isMeta": true,
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Base directory for this skill: /tmp/skill\n\n# Skill body"}]
+                }
+            }),
+            json!({
+                "type": "attachment",
+                "uuid": "skill-listing",
+                "parentUuid": "skill-meta",
+                "timestamp": "2026-07-05T01:30:50.000Z",
+                "attachment": {"type": "skill_listing", "content": "available skills"}
+            }),
+            json!({
+                "type": "last-prompt",
+                "leafUuid": "first-replay",
+                "sessionId": "session"
+            }),
+            json!({
+                "type": "user",
+                "uuid": "actual-prompt",
+                "parentUuid": "same-parent",
+                "promptId": "prompt-actual",
+                "timestamp": "2026-07-05T01:31:00.000Z",
+                "cwd": "/tmp/project",
+                "message": {"role": "user", "content": wrapped}
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "answer",
+                "parentUuid": "actual-prompt",
+                "timestamp": "2026-07-05T01:31:01.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "真实回答"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let parsed = parse_conversation_file(&path).expect("fixture 应能解析");
+        assert_eq!(parsed.first_prompt, real_prompt);
+        assert_eq!(parsed.message_count, 2);
+        assert_eq!(
+            parsed
+                .user_prompts
+                .iter()
+                .filter(|p| p.text == format!("/superpowers:requesting-code-review {real_prompt}"))
+                .count(),
+            1
+        );
+
+        let detail = parse_conversation_detail(&path).expect("fixture 应能解析");
+        let expected_prompt = format!("/superpowers:requesting-code-review {real_prompt}");
+        assert_eq!(
+            detail
+                .messages
+                .iter()
+                .filter(|m| {
+                    m.role == "user"
+                        && !m.is_meta
+                        && m.blocks
+                            .iter()
+                            .any(|b| b.text.as_deref() == Some(expected_prompt.as_str()))
+                })
+                .count(),
+            1
+        );
+        assert!(detail.messages.iter().any(|m| m.uuid == "skill-meta"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claude_repeated_real_user_prompt_is_preserved_after_assistant_output() {
+        let path = std::env::temp_dir().join(format!(
+            "cc_history_viewer_claude_real_repeat_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let jsonl = [
+            json!({
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": "root",
+                "promptId": "p1",
+                "timestamp": "2026-07-05T01:00:00.000Z",
+                "cwd": "/tmp/project",
+                "message": {"role": "user", "content": "重复问题"}
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "timestamp": "2026-07-05T01:00:01.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "第一次回答"}]
+                }
+            }),
+            json!({
+                "type": "user",
+                "uuid": "u2",
+                "parentUuid": "u1",
+                "promptId": "p2",
+                "timestamp": "2026-07-05T01:00:02.000Z",
+                "cwd": "/tmp/project",
+                "message": {"role": "user", "content": "重复问题"}
+            }),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let parsed = parse_conversation_file(&path).expect("fixture 应能解析");
+        assert_eq!(
+            parsed
+                .user_prompts
+                .iter()
+                .filter(|p| p.text == "重复问题")
+                .count(),
+            2
+        );
+        assert_eq!(parsed.message_count, 3);
+
+        let detail = parse_conversation_detail(&path).expect("fixture 应能解析");
+        assert_eq!(
+            detail
+                .messages
+                .iter()
+                .filter(|m| m.role == "user"
+                    && m.blocks
+                        .iter()
+                        .any(|b| b.text.as_deref() == Some("重复问题")))
+                .count(),
+            2
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -2423,6 +3527,71 @@ mod tests {
                 Some("tool-b")
             ]
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claude_message_count_excludes_tool_carrier_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "cc_history_viewer_message_count_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let jsonl = [
+            json!({
+                "type": "user",
+                "uuid": "u-1",
+                "timestamp": "2026-07-04T00:00:00.000Z",
+                "cwd": "/tmp/project",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "真实问题"}]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "a-tool",
+                "timestamp": "2026-07-04T00:00:01.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tool-a", "name": "Bash", "input": {"command": "pwd"}}
+                    ]
+                }
+            }),
+            json!({
+                "type": "user",
+                "uuid": "result-a",
+                "timestamp": "2026-07-04T00:00:02.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "tool-a", "content": "/tmp/project"}]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "a-answer",
+                "timestamp": "2026-07-04T00:00:03.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "真实回答"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let parsed = parse_conversation_file(&path).expect("fixture 应能解析");
+        assert_eq!(parsed.message_count, 2);
+        assert_eq!(parsed.user_prompts.len(), 1);
+        assert_eq!(parsed.first_prompt, "真实问题");
 
         let _ = std::fs::remove_file(&path);
     }

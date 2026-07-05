@@ -61,7 +61,6 @@ interface Store {
   /** 其它 prompt 类型的显示开关 */
   promptVisibility: PromptVisibility;
   setPromptVisibility: (key: keyof PromptVisibility, value: boolean) => void;
-  togglePromptVisibility: (key: keyof PromptVisibility) => void;
 
   /** 当前进入的文件夹（真实路径），用于「当前文件夹」搜索 */
   currentProject: string | null;
@@ -79,9 +78,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [scope, setScope] = useState<SearchScope>("global");
   const [promptVisibility, setPromptVisibilityState] = useState<PromptVisibility>(
     () => loadPromptVisibility()
-  );
-  const [includeCommands, setIncludeCommandsState] = useState<boolean>(
-    () => loadPromptVisibility().includeCommands
   );
   const [currentProject, setCurrentProjectState] = useState<string | null>(
     null
@@ -112,30 +108,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 
   const setIncludeCommands = useCallback((b: boolean) => {
-    setIncludeCommandsState(b);
     setPromptVisibilityState((v) => ({ ...v, includeCommands: b }));
-    localStorage.setItem("cchv-include-commands", String(b));
   }, []);
 
   const setPromptVisibility = useCallback(
     (key: keyof PromptVisibility, value: boolean) => {
       setPromptVisibilityState((v) => ({ ...v, [key]: value }));
-      if (key === "includeCommands") {
-        setIncludeCommandsState(value);
-      }
-    },
-    []
-  );
-
-  const togglePromptVisibility = useCallback(
-    (key: keyof PromptVisibility) => {
-      setPromptVisibilityState((v) => {
-        const next = { ...v, [key]: !v[key] } as PromptVisibility;
-        if (key === "includeCommands") {
-          setIncludeCommandsState(next.includeCommands);
-        }
-        return next;
-      });
     },
     []
   );
@@ -157,11 +135,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setQuery,
       scope,
       setScope,
-      includeCommands,
+      includeCommands: promptVisibility.includeCommands,
       setIncludeCommands,
       promptVisibility,
       setPromptVisibility,
-      togglePromptVisibility,
       currentProject,
       currentProjectName,
       setCurrentProject,
@@ -171,11 +148,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       toggleTheme,
       query,
       scope,
-      includeCommands,
       setIncludeCommands,
       promptVisibility,
       setPromptVisibility,
-      togglePromptVisibility,
       currentProject,
       currentProjectName,
       setCurrentProject,

@@ -5,6 +5,8 @@ use crate::indexer::{self, AppIndex};
 use crate::models::*;
 use crate::parser;
 use crate::state::{self, load_settings, resolve_data_paths, resolve_from_settings, AppState};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
 
@@ -28,28 +30,37 @@ fn cleanup_legacy_cache(app: &AppHandle) {
 
 /// 确保索引已构建（懒加载）
 fn ensure_index(state: &AppState, app: &AppHandle) -> Result<(), String> {
-    let mut guard = state.index.lock().map_err(|e| e.to_string())?;
-    if guard.is_some() {
-        return Ok(());
+    {
+        let guard = state.index.lock().map_err(|e| e.to_string())?;
+        if guard.is_some() {
+            return Ok(());
+        }
+    }
+    let _build_guard = state.build_lock.lock().map_err(|e| e.to_string())?;
+    {
+        let guard = state.index.lock().map_err(|e| e.to_string())?;
+        if guard.is_some() {
+            return Ok(());
+        }
     }
     let paths = resolve_data_paths(app)?;
     if !paths.history.exists() && !paths.projects.exists() {
-        if paths.codex_sessions.exists() {
-            cleanup_legacy_cache(app);
-            let cache = cache_file(app);
-            *guard = Some(indexer::load_or_build(&paths, cache.as_deref()));
-            return Ok(());
+        if !paths.codex_sessions.exists() {
+            return Err(format!(
+                "未找到数据源：{}、{} 与 {} 均不存在。请在设置中检查数据目录配置。",
+                paths.history.display(),
+                paths.projects.display(),
+                paths.codex_sessions.display()
+            ));
         }
-        return Err(format!(
-            "未找到数据源：{}、{} 与 {} 均不存在。请在设置中检查数据目录配置。",
-            paths.history.display(),
-            paths.projects.display(),
-            paths.codex_sessions.display()
-        ));
     }
     cleanup_legacy_cache(app);
     let cache = cache_file(app);
-    *guard = Some(indexer::load_or_build(&paths, cache.as_deref()));
+    let idx = indexer::load_or_build(&paths, cache.as_deref());
+    let mut guard = state.index.lock().map_err(|e| e.to_string())?;
+    if guard.is_none() {
+        *guard = Some(idx);
+    }
     Ok(())
 }
 
@@ -169,7 +180,7 @@ fn session_context(
     state: &AppState,
     app: &AppHandle,
     session_id: &str,
-) -> Result<(String, Option<String>), String> {
+) -> Result<(String, AgentKind, Option<String>), String> {
     ensure_index(state, app)?;
     let guard = state.index.lock().map_err(|e| e.to_string())?;
     let idx = guard.as_ref().ok_or("索引尚未就绪")?;
@@ -178,13 +189,33 @@ fn session_context(
         .get(session_id)
         .cloned()
         .ok_or_else(|| format!("找不到会话文件：{session_id}"))?;
-    let project = idx
+    let session = idx
         .sessions
         .iter()
         .find(|s| s.session_id == session_id)
-        .map(|s| s.project.clone())
-        .filter(|p| !p.is_empty());
-    Ok((file, project))
+        .ok_or_else(|| format!("找不到会话摘要：{session_id}"))?;
+    let agent = session.agent;
+    let project = Some(session.project.clone()).filter(|p| !p.is_empty());
+    Ok((file, agent, project))
+}
+
+fn load_conversation_detail(
+    state: &AppState,
+    app: &AppHandle,
+    session_id: &str,
+) -> Result<ConversationDetail, String> {
+    let (file, agent, project) = session_context(state, app, session_id)?;
+    let mut detail = match agent {
+        AgentKind::Codex => parser::parse_codex_conversation_detail(Path::new(&file)),
+        AgentKind::ClaudeCode => parser::parse_conversation_detail(Path::new(&file)),
+    }
+    .ok_or_else(|| "对话文件解析失败".to_string())?;
+    if detail.project.is_empty() {
+        if let Some(project) = project {
+            detail.project = project;
+        }
+    }
+    Ok(detail)
 }
 
 /// 单个会话的完整对话详情
@@ -194,20 +225,7 @@ pub fn get_conversation(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<ConversationDetail, String> {
-    let (file, project) = session_context(&state, &app, &session_id)?;
-    let is_codex = session_id.starts_with("codex:");
-    let mut detail = if is_codex {
-        parser::parse_codex_conversation_detail(Path::new(&file))
-    } else {
-        parser::parse_conversation_detail(Path::new(&file))
-    }
-    .ok_or_else(|| "对话文件解析失败".to_string())?;
-    if detail.project.is_empty() {
-        if let Some(project) = project {
-            detail.project = project;
-        }
-    }
-    Ok(detail)
+    load_conversation_detail(&state, &app, &session_id)
 }
 
 /// 索引元信息
@@ -221,11 +239,30 @@ pub fn get_index_meta(state: State<'_, AppState>, app: AppHandle) -> Result<Inde
     })
 }
 
-/// 强制重建索引（忽略缓存全量重解析）
+/// 增量刷新：仅重解析新增 / 变化的文件（其余复用缓存），拾取最新数据。
 #[tauri::command]
 pub fn refresh_index(state: State<'_, AppState>, app: AppHandle) -> Result<IndexMeta, String> {
     let paths = resolve_data_paths(&app)?;
     let cache = cache_file(&app);
+    let _build_guard = state.build_lock.lock().map_err(|e| e.to_string())?;
+    let idx = indexer::load_or_build(&paths, cache.as_deref());
+    let meta = IndexMeta {
+        built_at: idx.built_at,
+        from_cache: idx.from_cache,
+        source_files: idx.source_files,
+        reparsed_files: idx.reparsed_files,
+    };
+    let mut guard = state.index.lock().map_err(|e| e.to_string())?;
+    *guard = Some(idx);
+    Ok(meta)
+}
+
+/// 强制全量重建：忽略缓存重解析全部文件。用于罕见的缓存失准（如保留 mtime 的文件恢复）。
+#[tauri::command]
+pub fn rebuild_index(state: State<'_, AppState>, app: AppHandle) -> Result<IndexMeta, String> {
+    let paths = resolve_data_paths(&app)?;
+    let cache = cache_file(&app);
+    let _build_guard = state.build_lock.lock().map_err(|e| e.to_string())?;
     let idx = indexer::build_and_cache(&paths, cache.as_deref());
     let meta = IndexMeta {
         built_at: idx.built_at,
@@ -335,8 +372,7 @@ pub fn build_prompt_export(
             return Err("该范围内没有可导出的 prompt。".to_string());
         }
         let base = format!("CC-Prompts_{start_date}_{end_date}");
-        let target = unique_export_path(&base);
-        std::fs::write(&target, &data.markdown).map_err(|e| format!("写入文件失败：{e}"))?;
+        let target = write_unique_export(&base, &data.markdown)?;
         path = Some(target.to_string_lossy().to_string());
     }
 
@@ -376,8 +412,7 @@ pub fn export_search_results(
         }
         let date = chrono::Local::now().format("%Y-%m-%d");
         let base = format!("CC-Search_{}_{date}", sanitize_for_filename(&query));
-        let target = unique_export_path(&base);
-        std::fs::write(&target, &data.markdown).map_err(|e| format!("写入文件失败：{e}"))?;
+        let target = write_unique_export(&base, &data.markdown)?;
         path = Some(target.to_string_lossy().to_string());
     }
 
@@ -413,31 +448,20 @@ pub fn export_conversation(
     include_tools: bool,
     include_skills: bool,
     include_meta: bool,
+    include_codex_commentary: bool,
+    include_subagent: bool,
     include_time: bool,
-    message_uuids: Vec<String>,
+    message_indexes: Vec<usize>,
     write: bool,
     lang: Option<String>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<ConversationExportResult, String> {
-    let (file, project) = session_context(&state, &app, &session_id)?;
-    let is_codex = session_id.starts_with("codex:");
-    let mut detail = if is_codex {
-        parser::parse_codex_conversation_detail(Path::new(&file))
-    } else {
-        parser::parse_conversation_detail(Path::new(&file))
-    }
-    .ok_or_else(|| "对话文件解析失败".to_string())?;
-    if detail.project.is_empty() {
-        if let Some(project) = project {
-            detail.project = project;
-        }
-    }
+    let detail = load_conversation_detail(&state, &app, &session_id)?;
     let lang = Lang::from_opt(lang.as_deref());
-    let selected = (!message_uuids.is_empty()).then(|| {
-        message_uuids
+    let selected = (!message_indexes.is_empty()).then(|| {
+        message_indexes
             .into_iter()
-            .filter(|id| !id.is_empty())
             .collect::<std::collections::HashSet<_>>()
     });
     let options = export::ConversationExportOptions {
@@ -445,6 +469,8 @@ pub fn export_conversation(
         include_tools,
         include_skills,
         include_meta,
+        include_codex_commentary,
+        include_subagent,
         include_time,
     };
     let (markdown, exported_count) =
@@ -455,8 +481,7 @@ pub fn export_conversation(
         let short_id: String = session_id.chars().take(8).collect();
         let date = chrono::Local::now().format("%Y-%m-%d");
         let base = format!("CC-Conversation_{short_id}_{date}");
-        let target = unique_export_path(&base);
-        std::fs::write(&target, &markdown).map_err(|e| format!("写入文件失败：{e}"))?;
+        let target = write_unique_export(&base, &markdown)?;
         path = Some(target.to_string_lossy().to_string());
     }
 
@@ -501,16 +526,42 @@ pub fn reveal_path(path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 下载目录下生成不冲突的导出文件路径：base.md → base (2).md → …
-fn unique_export_path(base: &str) -> PathBuf {
-    let dir = dirs::download_dir()
+fn export_dir() -> PathBuf {
+    dirs::download_dir()
         .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let mut candidate = dir.join(format!("{base}.md"));
-    let mut n = 2;
-    while candidate.exists() {
-        candidate = dir.join(format!("{base} ({n}).md"));
-        n += 1;
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn export_candidate(base: &str, n: usize) -> PathBuf {
+    let dir = export_dir();
+    if n == 1 {
+        dir.join(format!("{base}.md"))
+    } else {
+        dir.join(format!("{base} ({n}).md"))
     }
-    candidate
+}
+
+/// 原子创建不冲突的导出文件：base.md → base (2).md → …
+fn write_unique_export(base: &str, markdown: &str) -> Result<PathBuf, String> {
+    let dir = export_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建导出目录失败：{e}"))?;
+    let mut n = 1;
+    loop {
+        let candidate = export_candidate(base, n);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                file.write_all(markdown.as_bytes())
+                    .map_err(|e| format!("写入文件失败：{e}"))?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                n += 1;
+            }
+            Err(e) => return Err(format!("写入文件失败：{e}")),
+        }
+    }
 }

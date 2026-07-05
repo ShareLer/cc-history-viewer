@@ -80,6 +80,9 @@ export function ActivityChart({ data }: { data: DayCount[] }) {
 /** 24 小时活跃分布 */
 export function HourChart({ data }: { data: HourCount[] }) {
   const rows = data.map((h) => ({ name: `${h.hour}`, count: h.count }));
+  if (rows.length === 0) {
+    return <EmptyChart />;
+  }
   return (
     <ResponsiveContainer width="100%" height={208}>
       <BarChart data={rows} margin={{ top: 8, right: 8, bottom: 0, left: -18 }}>

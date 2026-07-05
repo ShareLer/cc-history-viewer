@@ -31,6 +31,7 @@ import {
   cn,
   encodePath,
   formatNumber,
+  pathBaseName,
   prettyPath,
 } from "@/lib/utils";
 import { api, errMessage } from "@/lib/api";
@@ -41,6 +42,7 @@ type ViewOptions = {
   showSkills: boolean;
   showMeta: boolean;
   showCodexCommentary: boolean;
+  showSubagent: boolean;
 };
 
 type ExportOptions = {
@@ -48,41 +50,60 @@ type ExportOptions = {
   includeTools: boolean;
   includeSkills: boolean;
   includeMeta: boolean;
+  includeCodexCommentary: boolean;
+  includeSubagent: boolean;
   includeTime: boolean;
 };
 
-function shouldShowBlock(block: ContentBlock, options: ViewOptions): boolean {
+type BlockToggles = {
+  thinking: boolean;
+  tools: boolean;
+  skills: boolean;
+};
+
+function blockEnabled(block: ContentBlock, toggles: BlockToggles): boolean {
   switch (block.kind) {
     case "text":
     case "image":
       return true;
     case "thinking":
-      return options.showThinking;
+      return toggles.thinking;
     case "tool_use":
     case "tool_result":
-      return options.showTools;
+      return toggles.tools;
     case "skill":
-      return options.showSkills;
+      return toggles.skills;
     default:
       return false;
   }
 }
 
-function shouldExportBlock(block: ContentBlock, options: ExportOptions): boolean {
-  switch (block.kind) {
-    case "text":
-    case "image":
-      return true;
-    case "thinking":
-      return options.includeThinking;
-    case "tool_use":
-    case "tool_result":
-      return options.includeTools;
-    case "skill":
-      return options.includeSkills;
-    default:
-      return false;
-  }
+function shouldShowBlock(
+  block: ContentBlock,
+  options: ViewOptions,
+  msg: ChatMessage
+): boolean {
+  // 子代理消息整体由 showSubagent 控制（见 isMessageVisible），
+  // 展开时内部块全部显示，不再受工具/思考/Skill 开关影响。
+  if (msg.isSubagent) return true;
+  return blockEnabled(block, {
+    thinking: options.showThinking,
+    tools: options.showTools,
+    skills: options.showSkills,
+  });
+}
+
+function shouldExportBlock(
+  block: ContentBlock,
+  options: ExportOptions,
+  msg: ChatMessage
+): boolean {
+  if (msg.isSubagent) return true;
+  return blockEnabled(block, {
+    thinking: options.includeThinking,
+    tools: options.includeTools,
+    skills: options.includeSkills,
+  });
 }
 
 function isMessageVisible(
@@ -90,6 +111,8 @@ function isMessageVisible(
   options: ViewOptions,
   agent: string
 ): boolean {
+  // 子代理消息（sidechain / Agent / spawn_agent 等）独立开关，与工具解耦。
+  if (msg.isSubagent) return options.showSubagent && msg.blocks.length > 0;
   if (
     agent === "codex" &&
     msg.role === "assistant" &&
@@ -101,14 +124,59 @@ function isMessageVisible(
   if (msg.isMeta && !options.showMeta) return false;
   if (msg.metaKind === "command" && !options.showTools) return false;
   if (msg.metaKind === "skill" && !options.showSkills) return false;
-  return msg.blocks.some((block) => shouldShowBlock(block, options));
+  return msg.blocks.some((block) => shouldShowBlock(block, options, msg));
 }
 
-function isMessageExportable(msg: ChatMessage, options: ExportOptions): boolean {
+function isMessageExportable(
+  msg: ChatMessage,
+  options: ExportOptions,
+  agent: string
+): boolean {
+  if (msg.isSubagent) return options.includeSubagent && msg.blocks.length > 0;
+  if (
+    agent === "codex" &&
+    msg.role === "assistant" &&
+    msg.phase === "commentary" &&
+    !options.includeCodexCommentary
+  ) {
+    return false;
+  }
   if (msg.isMeta && !options.includeMeta) return false;
   if (msg.metaKind === "command" && !options.includeTools) return false;
   if (msg.metaKind === "skill" && !options.includeSkills) return false;
-  return msg.blocks.some((block) => shouldExportBlock(block, options));
+  return msg.blocks.some((block) => shouldExportBlock(block, options, msg));
+}
+
+function revealOptionsForMessage(
+  msg: ChatMessage,
+  current: ViewOptions,
+  agent: string
+): ViewOptions {
+  // 子代理消息只需打开 showSubagent；其内部块不受其它开关约束。
+  if (msg.isSubagent) {
+    return { ...current, showSubagent: true };
+  }
+  return {
+    ...current,
+    showThinking:
+      current.showThinking || msg.blocks.some((block) => block.kind === "thinking"),
+    showTools:
+      current.showTools ||
+      msg.metaKind === "command" ||
+      msg.blocks.some(
+        (block) => block.kind === "tool_use" || block.kind === "tool_result"
+      ),
+    showSkills:
+      current.showSkills ||
+      msg.metaKind === "skill" ||
+      msg.blocks.some((block) => block.kind === "skill"),
+    showMeta: current.showMeta || msg.isMeta,
+    showCodexCommentary:
+      current.showCodexCommentary ||
+      (agent === "codex" &&
+        msg.role === "assistant" &&
+        msg.phase === "commentary"),
+  };
 }
 
 function BlockView({
@@ -194,7 +262,7 @@ function MessageBubble({
   return (
     <div
       className={cn(
-        "rounded-xl border p-4 transition-shadow duration-500",
+        "rounded-xl border p-4 transition-shadow duration-150 motion-reduce:transition-none",
         isUser && !isMeta && "border-accent/30 bg-accent/[0.08]",
         !isUser && !isSystem && "border-border bg-surface",
         isSystem &&
@@ -266,6 +334,7 @@ export function ConversationDetail() {
     showSkills: false,
     showMeta: false,
     showCodexCommentary: false,
+    showSubagent: false,
   });
 
   const [exportOpen, setExportOpen] = useState(false);
@@ -274,23 +343,39 @@ export function ConversationDetail() {
     includeTools: false,
     includeSkills: false,
     includeMeta: false,
+    includeCodexCommentary: false,
+    includeSubagent: false,
     includeTime: false,
   });
-  const [selectedMessageUuids, setSelectedMessageUuids] = useState<string[]>([]);
+  const [selectedMessageKeys, setSelectedMessageKeys] = useState<string[]>([]);
   const selectAllRef = useRef<HTMLInputElement>(null);
-  const previousExportableVisibleIdsRef = useRef<string[]>([]);
+  const previousExportableVisibleKeysRef = useRef<string[]>([]);
+  const jumpedTargetRef = useRef<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportResult, setExportResult] =
     useState<ConversationExportResult | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!data || data.messages.length === 0) return;
+  const effectiveViewOptions = useMemo<ViewOptions>(() => {
+    if (!exportOpen) return viewOptions;
+    return {
+      showThinking: viewOptions.showThinking || exportOptions.includeThinking,
+      showTools: viewOptions.showTools || exportOptions.includeTools,
+      showSkills: viewOptions.showSkills || exportOptions.includeSkills,
+      showMeta: viewOptions.showMeta || exportOptions.includeMeta,
+      showCodexCommentary:
+        viewOptions.showCodexCommentary || exportOptions.includeCodexCommentary,
+      showSubagent: viewOptions.showSubagent || exportOptions.includeSubagent,
+    };
+  }, [exportOpen, exportOptions, viewOptions]);
+
+  const targetIndex = useMemo(() => {
+    if (!data || data.messages.length === 0) return undefined;
     let best = targetUuid
       ? data.messages.findIndex((m) => m.uuid === targetUuid)
       : -1;
     if (best < 0) {
-      if (!targetTs) return;
+      if (!targetTs) return undefined;
       let bestDiff = Number.POSITIVE_INFINITY;
       data.messages.forEach((m, i) => {
         const diff = Math.abs(m.timestamp - targetTs);
@@ -300,26 +385,47 @@ export function ConversationDetail() {
         }
       });
     }
-    setHighlightIdx(best);
-    requestAnimationFrame(() => {
-      document
-        .getElementById(`msg-${best}`)
-        ?.scrollIntoView({ block: "center" });
-    });
-    const timer = setTimeout(() => setHighlightIdx(null), 2500);
-    return () => clearTimeout(timer);
+    return best >= 0 ? best : undefined;
   }, [data, targetTs, targetUuid]);
 
-  const effectiveViewOptions = useMemo<ViewOptions>(() => {
-    if (!exportOpen) return viewOptions;
-    return {
-      showThinking: viewOptions.showThinking || exportOptions.includeThinking,
-      showTools: viewOptions.showTools || exportOptions.includeTools,
-      showSkills: viewOptions.showSkills || exportOptions.includeSkills,
-      showMeta: viewOptions.showMeta || exportOptions.includeMeta,
-      showCodexCommentary: viewOptions.showCodexCommentary,
-    };
-  }, [exportOpen, exportOptions, viewOptions]);
+  useEffect(() => {
+    const jumpKey = sessionId ? `${sessionId}:${targetUuid ?? ""}:${targetTs ?? ""}` : null;
+    if (!jumpKey || jumpedTargetRef.current !== jumpKey) {
+      setHighlightIdx(null);
+    }
+    if (!data || targetIndex == null) return;
+    const target = data.messages[targetIndex];
+    if (!target) return;
+    if (!isMessageVisible(target, effectiveViewOptions, data.agent)) {
+      setViewOptions((prev) => {
+        const next = revealOptionsForMessage(target, prev, data.agent);
+        return Object.is(next, prev) ||
+          (next.showThinking === prev.showThinking &&
+            next.showTools === prev.showTools &&
+            next.showSkills === prev.showSkills &&
+            next.showMeta === prev.showMeta &&
+            next.showCodexCommentary === prev.showCodexCommentary &&
+            next.showSubagent === prev.showSubagent)
+          ? prev
+          : next;
+      });
+      return;
+    }
+    if (jumpedTargetRef.current === jumpKey) return;
+    jumpedTargetRef.current = jumpKey;
+    setHighlightIdx(targetIndex);
+    requestAnimationFrame(() => {
+      document
+        .getElementById(`msg-${targetIndex}`)
+        ?.scrollIntoView({ block: "center" });
+    });
+  }, [data, effectiveViewOptions, sessionId, targetIndex, targetTs, targetUuid]);
+
+  useEffect(() => {
+    if (highlightIdx == null) return;
+    const timer = setTimeout(() => setHighlightIdx(null), 2500);
+    return () => clearTimeout(timer);
+  }, [highlightIdx]);
 
   const visibleMessages = useMemo(() => {
     if (!data) return [];
@@ -328,7 +434,7 @@ export function ConversationDetail() {
         msg,
         index,
         blocks: msg.blocks.filter((block) =>
-          shouldShowBlock(block, effectiveViewOptions)
+          shouldShowBlock(block, effectiveViewOptions, msg)
         ),
       }))
       .filter(
@@ -338,37 +444,38 @@ export function ConversationDetail() {
       );
   }, [data, effectiveViewOptions]);
 
-  const exportableVisibleIds = useMemo(() => {
+  const exportableVisibleKeys = useMemo(() => {
+    if (!data) return [];
     return visibleMessages
-      .filter(({ msg }) => isMessageExportable(msg, exportOptions))
-      .map(({ msg }) => msg.uuid);
-  }, [visibleMessages, exportOptions]);
+      .filter(({ msg }) => isMessageExportable(msg, exportOptions, data.agent))
+      .map(({ index }) => String(index));
+  }, [data, visibleMessages, exportOptions]);
   const selectedExportableCount = useMemo(() => {
-    const selected = new Set(selectedMessageUuids);
-    return exportableVisibleIds.filter((uuid) => selected.has(uuid)).length;
-  }, [exportableVisibleIds, selectedMessageUuids]);
+    const selected = new Set(selectedMessageKeys);
+    return exportableVisibleKeys.filter((key) => selected.has(key)).length;
+  }, [exportableVisibleKeys, selectedMessageKeys]);
   const allExportableSelected =
-    exportableVisibleIds.length > 0 &&
-    selectedExportableCount === exportableVisibleIds.length;
+    exportableVisibleKeys.length > 0 &&
+    selectedExportableCount === exportableVisibleKeys.length;
   const someExportableSelected =
     selectedExportableCount > 0 && !allExportableSelected;
 
   useEffect(() => {
     if (!exportOpen) {
-      previousExportableVisibleIdsRef.current = exportableVisibleIds;
+      previousExportableVisibleKeysRef.current = exportableVisibleKeys;
       return;
     }
-    const previousIds = previousExportableVisibleIdsRef.current;
-    const allowed = new Set(exportableVisibleIds);
-    setSelectedMessageUuids((prev) => {
+    const previousKeys = previousExportableVisibleKeysRef.current;
+    const allowed = new Set(exportableVisibleKeys);
+    setSelectedMessageKeys((prev) => {
       const selected = new Set(prev);
       const hadAllSelected =
-        previousIds.length > 0 && previousIds.every((uuid) => selected.has(uuid));
-      if (hadAllSelected) return exportableVisibleIds;
-      return prev.filter((uuid) => allowed.has(uuid));
+        previousKeys.length > 0 && previousKeys.every((key) => selected.has(key));
+      if (hadAllSelected) return exportableVisibleKeys;
+      return prev.filter((key) => allowed.has(key));
     });
-    previousExportableVisibleIdsRef.current = exportableVisibleIds;
-  }, [exportOpen, exportableVisibleIds]);
+    previousExportableVisibleKeysRef.current = exportableVisibleKeys;
+  }, [exportOpen, exportableVisibleKeys]);
 
   useEffect(() => {
     if (selectAllRef.current) {
@@ -382,22 +489,29 @@ export function ConversationDetail() {
     setExportError(null);
     setExportResult(null);
     if (next) {
-      setSelectedMessageUuids(exportableVisibleIds);
+      setSelectedMessageKeys(exportableVisibleKeys);
     }
   };
 
-  const handleToggleSelected = (uuid: string, checked: boolean) => {
-    setSelectedMessageUuids((prev) =>
-      checked ? [...new Set([...prev, uuid])] : prev.filter((id) => id !== uuid)
+  const handleToggleSelected = (key: string, checked: boolean) => {
+    setSelectedMessageKeys((prev) =>
+      checked ? [...new Set([...prev, key])] : prev.filter((id) => id !== key)
     );
   };
 
   const handleToggleSelectAll = (checked: boolean) => {
-    setSelectedMessageUuids(checked ? exportableVisibleIds : []);
+    setSelectedMessageKeys(checked ? exportableVisibleKeys : []);
   };
 
   const handleExport = async () => {
-    if (!data || exporting || selectedMessageUuids.length === 0) return;
+    if (!data || exporting || selectedMessageKeys.length === 0) return;
+    const messageIndexes = selectedMessageKeys
+      .map((key) => Number(key))
+      .filter(
+        (index) =>
+          Number.isInteger(index) && index >= 0 && index < data.messages.length
+      );
+    if (messageIndexes.length === 0) return;
     setExporting(true);
     setExportError(null);
     setExportResult(null);
@@ -410,8 +524,10 @@ export function ConversationDetail() {
         includeTools: exportOptions.includeTools,
         includeSkills: exportOptions.includeSkills,
         includeMeta: exportOptions.includeMeta,
+        includeCodexCommentary: exportOptions.includeCodexCommentary,
+        includeSubagent: exportOptions.includeSubagent,
         includeTime: exportOptions.includeTime,
-        messageUuids: selectedMessageUuids,
+        messageIndexes,
       });
       setExportResult(res);
     } catch (e) {
@@ -432,6 +548,10 @@ export function ConversationDetail() {
   };
 
   const agentLabel = data?.agent === "codex" ? t("agentCodex") : t("agentClaudeCode");
+  const hasSubagent = useMemo(
+    () => data?.messages.some((m) => m.isSubagent) ?? false,
+    [data]
+  );
   const resumeCommand = data && data.agent === "claudeCode"
     ? data.project
       ? `cd "${data.project}" && claude --resume ${data.sessionId}`
@@ -443,7 +563,9 @@ export function ConversationDetail() {
       <Button
         variant="ghost"
         size="sm"
-        onClick={() => navigate(-1)}
+        onClick={() =>
+          window.history.state?.idx > 0 ? navigate(-1) : navigate("/")
+        }
         className="mb-4 -ml-2"
       >
         <ArrowLeft size={14} />
@@ -571,6 +693,22 @@ export function ConversationDetail() {
                 />
                 {t("showMetaToggle")}
               </label>
+              {hasSubagent && (
+                <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-foreground">
+                  <input
+                    type="checkbox"
+                    checked={viewOptions.showSubagent}
+                    onChange={(e) =>
+                      setViewOptions((prev) => ({
+                        ...prev,
+                        showSubagent: e.target.checked,
+                      }))
+                    }
+                    className="accent-[var(--accent)]"
+                  />
+                  {t("showSubagentToggle")}
+                </label>
+              )}
             </div>
 
             {exportOpen && (
@@ -582,7 +720,7 @@ export function ConversationDetail() {
                       ref={selectAllRef}
                       type="checkbox"
                       checked={allExportableSelected}
-                      disabled={exportableVisibleIds.length === 0}
+                      disabled={exportableVisibleKeys.length === 0}
                       onChange={(e) => handleToggleSelectAll(e.target.checked)}
                       className="accent-[var(--accent)] disabled:opacity-40"
                     />
@@ -644,6 +782,38 @@ export function ConversationDetail() {
                     />
                     {t("includeMetaInExportLabel")}
                   </label>
+                  {hasSubagent && (
+                    <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-foreground">
+                      <input
+                        type="checkbox"
+                        checked={exportOptions.includeSubagent}
+                        onChange={(e) =>
+                          setExportOptions((prev) => ({
+                            ...prev,
+                            includeSubagent: e.target.checked,
+                          }))
+                        }
+                        className="accent-[var(--accent)]"
+                      />
+                      {t("includeSubagentInExportLabel")}
+                    </label>
+                  )}
+                  {data.agent === "codex" && (
+                    <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-foreground">
+                      <input
+                        type="checkbox"
+                        checked={exportOptions.includeCodexCommentary}
+                        onChange={(e) =>
+                          setExportOptions((prev) => ({
+                            ...prev,
+                            includeCodexCommentary: e.target.checked,
+                          }))
+                        }
+                        className="accent-[var(--accent)]"
+                      />
+                      {t("includeCodexCommentaryInExportLabel")}
+                    </label>
+                  )}
                   <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-foreground">
                     <input
                       type="checkbox"
@@ -660,13 +830,13 @@ export function ConversationDetail() {
                   </label>
                   <span className="text-xs text-muted">
                     {t("selectedMessagesCount", {
-                      count: formatNumber(selectedMessageUuids.length),
+                      count: formatNumber(selectedExportableCount),
                     })}
                   </span>
                   <Button
                     size="sm"
                     onClick={handleExport}
-                    disabled={exporting || selectedMessageUuids.length === 0}
+                    disabled={exporting || selectedExportableCount === 0}
                   >
                     {exporting ? (
                       <Spinner className="border-accent-fg/40 border-t-accent-fg" />
@@ -699,7 +869,7 @@ export function ConversationDetail() {
                     title={exportResult.path ?? undefined}
                   >
                     {exportResult.path
-                      ? exportResult.path.split("/").pop()
+                      ? pathBaseName(exportResult.path)
                       : t("notWrittenToFile")}
                   </span>
                 </span>
@@ -761,8 +931,13 @@ export function ConversationDetail() {
           ) : (
             <div className="space-y-3">
               {visibleMessages.map(({ msg, index, blocks }) => {
-                const exportable = isMessageExportable(msg, exportOptions);
-                const checked = selectedMessageUuids.includes(msg.uuid);
+                const exportable = isMessageExportable(
+                  msg,
+                  exportOptions,
+                  data.agent
+                );
+                const messageKey = String(index);
+                const checked = selectedMessageKeys.includes(messageKey);
                 return (
                   <div
                     key={msg.uuid || index}
@@ -775,7 +950,7 @@ export function ConversationDetail() {
                         checked={checked}
                         disabled={!exportable}
                         onChange={(e) =>
-                          handleToggleSelected(msg.uuid, e.target.checked)
+                          handleToggleSelected(messageKey, e.target.checked)
                         }
                         className="mt-3 accent-[var(--accent)] disabled:opacity-40"
                       />

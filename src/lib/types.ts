@@ -87,6 +87,7 @@ export interface ChatMessage {
   callId: string | null;
   timestamp: number;
   isSidechain: boolean;
+  isSubagent: boolean;
   isMeta: boolean;
   metaKind: "command" | "skill" | null;
   attributionSkill: string | null;
@@ -229,8 +230,10 @@ export interface ConversationExportParams {
   includeTools: boolean;
   includeSkills: boolean;
   includeMeta: boolean;
+  includeCodexCommentary: boolean;
+  includeSubagent: boolean;
   includeTime: boolean;
-  messageUuids: string[];
+  messageIndexes: number[];
 }
 
 /* ----------------------------- 设置 ----------------------------- */

@@ -58,6 +58,11 @@
   border-color: var(--border);
 }
 
+button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ring) 60%, transparent);
+}
+
 html,
 body,
 #root {
@@ -92,27 +97,6 @@ body {
 ::selection {
   background: var(--accent);
   color: var(--accent-fg);
-}
-
-.home-refresh-frame {
-  animation: home-refresh-frame-in 180ms ease-out both;
-}
-
-@keyframes home-refresh-frame-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .home-refresh-frame {
-    animation: none;
-  }
 }
 
 .markdown-message {
