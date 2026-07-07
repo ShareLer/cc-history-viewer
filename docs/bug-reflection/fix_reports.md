@@ -111,3 +111,33 @@ Claude Code compact 后写入的上下文恢复摘要会以 `type=user` / `messa
 - 扫描本地 Claude projects：11 条 compact summary 全部带 `isCompactSummary=true` 与 `isVisibleInTranscriptOnly=true`，未发现旧格式漏标样本。
 - 新增回归测试 `claude_compact_summary_is_metadata_not_prompt`，覆盖标题、prompt 数、消息数和详情 meta 标记。
 - `cargo test --manifest-path src-tauri/Cargo.toml`
+
+# Fix Report - Codex Compacted Handoff Summary Shown As Final Answer
+
+## Bug 描述
+
+Codex rollout 中由上下文压缩生成的 handoff summary 可能以 `response_item` / `payload.type=message` / `role=assistant` / `phase=final_answer` 写入，随后再出现顶层 `type=compacted` 和 `event_msg.context_compacted`。详情页会把这类压缩摘要当成普通最终回答展示。
+
+## 根因
+
+解析器已有 Codex compaction 处理，但此前把“是否像压缩摘要”建立在标题/前缀白名单上。这类规则覆盖面不稳定，真实数据中的压缩摘要标题和语言形态会变化，继续维护前缀列表会反复漏判。更可靠的结构信号是：Codex 会先写入一个 `response_item` assistant `final_answer` 形式的摘要候选，随后写入顶层 `type=compacted` 控制事件，且 compacted payload 会覆盖这段摘要文本。
+
+## 尝试记录
+
+- 扫描含 `context_compacted` 的 rollout，确认该事件本身会在普通 commentary 附近反复出现，不能单独作为“前一条是压缩摘要”的判据。
+- 扫描含顶层 `type=compacted` 的 rollout，确认目标问题中的 `assistant/final_answer` 摘要会被后续 compacted payload 完整覆盖。
+- 测试中验证了不能只按 `compacted.payload` 包含候选文本无条件处理，否则普通短回答文本被 compacted payload 引用时会被误判。
+
+## 最终方案
+
+- 继续以顶层 `type=compacted` 为主判据，并只检查 compacted 前最近一条可展示消息是否为 assistant `final_answer` 候选；若中间出现真实用户消息、工具结果或其它可展示 response item，则候选失效。
+- 不再依赖 handoff/current-progress 等摘要前缀白名单；改为要求 compacted payload 覆盖候选全文或足够长的候选前缀。
+- 对候选文本设置最小实质长度，避免普通短回答被 compacted payload 引用时误判为压缩摘要。
+- 详情解析中不再删除这类消息，而是标记为 `is_meta=true`，默认受“元信息”开关隐藏。
+- 会话统计中这类压缩摘要不计入普通 assistant final answer。
+- 缓存版本升到 18，避免复用旧解析结果。
+
+## 验证
+
+- 新增/调整 Codex compaction 回归测试，覆盖 `**Current Progress**` + `compacted` + `context_compacted` 形态、无固定标题前缀的长摘要、以及普通短回答防误判。
+- `cargo test --manifest-path src-tauri/Cargo.toml`

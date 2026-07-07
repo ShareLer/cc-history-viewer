@@ -24,7 +24,8 @@ const DEDUP_WINDOW_MS: i64 = 5 * 60 * 1000;
 /// （v15：Claude Code 去除技能/上下文预派发造成的 replay 重复用户 prompt）
 /// （v16：嵌入在普通文本/代码示例中的 command wrapper 不再被误改写为 /model）
 /// （v17：Claude Code compact summary 不再作为真实用户 prompt / 标题 / 统计）
-const CACHE_VERSION: u32 = 17;
+/// （v18：Codex compacted 覆盖的 assistant 摘要标记为 meta，不再计为普通 final answer）
+const CACHE_VERSION: u32 = 18;
 
 /// 构建好的全量索引（仅驻留内存；磁盘缓存见 CacheV2）
 pub struct AppIndex {

@@ -848,6 +848,7 @@ pub fn parse_codex_session_file(path: &Path) -> Option<ConvFileResult> {
                             .and_then(|v| v.as_str())
                             .and_then(clean_prompt_text)
                         {
+                            last_compaction_candidate = None;
                             event_prompts.push(CodexUserEvent {
                                 timestamp: ts.unwrap_or(0),
                                 text,
@@ -876,9 +877,9 @@ pub fn parse_codex_session_file(path: &Path) -> Option<ConvFileResult> {
                         "assistant" => {
                             if let Some(text) = codex_countable_response_message_text(payload) {
                                 assistant_message_count += 1;
-                                if looks_like_codex_compaction_summary(&text) {
-                                    last_compaction_candidate = Some(text);
-                                }
+                                last_compaction_candidate = Some(text);
+                            } else {
+                                last_compaction_candidate = None;
                             }
                         }
                         "user" if !too_big => {
@@ -886,6 +887,7 @@ pub fn parse_codex_session_file(path: &Path) -> Option<ConvFileResult> {
                                 .and_then(|s| clean_prompt_text(&s))
                             {
                                 if !is_codex_context_injection(&text) {
+                                    last_compaction_candidate = None;
                                     fallback_prompts.push(CodexUserEvent {
                                         timestamp: ts.unwrap_or(0),
                                         text,
@@ -893,8 +895,10 @@ pub fn parse_codex_session_file(path: &Path) -> Option<ConvFileResult> {
                                 }
                             }
                         }
-                        _ => {}
+                        _ => last_compaction_candidate = None,
                     }
+                } else {
+                    last_compaction_candidate = None;
                 }
             }
             "compacted" => {
@@ -1020,6 +1024,7 @@ pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail
                         event_user_idx += 1;
                         let raw_session_id =
                             meta.session_id.clone().unwrap_or_else(|| file_stem.clone());
+                        last_compaction_candidate = None;
                         messages.push(ChatMessage {
                             uuid: format!("{raw_session_id}:user:{event_user_idx}"),
                             role: "user".to_string(),
@@ -1043,6 +1048,7 @@ pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail
                     if let Some(msg) = codex_event_tool_result_to_message(payload, &stable_uuid, ts)
                     {
                         push_unique_tool_result(&mut messages, msg, &mut seen_tool_results);
+                        last_compaction_candidate = None;
                     }
                 }
             }
@@ -1087,14 +1093,8 @@ pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail
                             msg.uuid = format!("{raw_session_id}:user:{fallback_user_idx}");
                         }
                     }
-                    let is_compaction_candidate = msg.role == "assistant"
-                        && msg.phase.as_deref() == Some("final_answer")
-                        && msg.blocks.iter().any(|b| {
-                            b.kind == "text"
-                                && b.text
-                                    .as_deref()
-                                    .is_some_and(looks_like_codex_compaction_summary)
-                        });
+                    let is_compaction_candidate =
+                        msg.role == "assistant" && msg.phase.as_deref() == Some("final_answer");
                     if is_tool_result_message(&msg) {
                         push_unique_tool_result(&mut messages, msg, &mut seen_tool_results);
                     } else {
@@ -1102,6 +1102,8 @@ pub fn parse_codex_conversation_detail(path: &Path) -> Option<ConversationDetail
                     }
                     if is_compaction_candidate {
                         last_compaction_candidate = Some(messages.len().saturating_sub(1));
+                    } else {
+                        last_compaction_candidate = None;
                     }
                 }
             }
@@ -1147,28 +1149,43 @@ fn remove_codex_compaction_summary(
     let Some(idx) = last_candidate.take() else {
         return;
     };
-    let Some(candidate) = messages.get(idx) else {
-        return;
+    let candidate_text = {
+        let Some(candidate) = messages.get(idx) else {
+            return;
+        };
+        if candidate.role != "assistant" || candidate.phase.as_deref() != Some("final_answer") {
+            return;
+        }
+        message_text(candidate)
     };
-    if candidate.role != "assistant" || candidate.phase.as_deref() != Some("final_answer") {
-        return;
-    }
-    let candidate_text = message_text(candidate);
     if codex_compaction_payload_contains_response(payload, &candidate_text) {
-        messages.remove(idx);
+        if let Some(candidate) = messages.get_mut(idx) {
+            candidate.is_meta = true;
+            candidate.meta_kind = None;
+        }
     }
 }
+
+const CODEX_COMPACTION_MIN_CANDIDATE_CHARS: usize = 80;
+const CODEX_COMPACTION_PREFIX_CHARS: usize = 1_000;
 
 fn compaction_payload_contains_message(compacted_text: &str, message: &str) -> bool {
     let message = message.trim();
     if message.is_empty() {
         return false;
     }
+    if message.chars().count() < CODEX_COMPACTION_MIN_CANDIDATE_CHARS {
+        return false;
+    }
     if compacted_text.contains(message) {
         return true;
     }
-    let prefix: String = message.chars().take(1_000).collect();
-    prefix.len() >= 40 && compacted_text.contains(prefix.trim())
+    let prefix: String = message
+        .chars()
+        .take(CODEX_COMPACTION_PREFIX_CHARS)
+        .collect();
+    prefix.trim().chars().count() >= CODEX_COMPACTION_MIN_CANDIDATE_CHARS
+        && compacted_text.contains(prefix.trim())
 }
 
 fn codex_compaction_payload_text(payload: &serde_json::Value) -> String {
@@ -1188,22 +1205,7 @@ fn codex_compaction_payload_contains_response(
 ) -> bool {
     let compacted_text = codex_compaction_payload_text(payload);
     !compacted_text.is_empty()
-        && looks_like_codex_compaction_summary(candidate_text)
         && compaction_payload_contains_message(&compacted_text, candidate_text)
-}
-
-fn looks_like_codex_compaction_summary(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with("**Task Context**")
-        || trimmed.starts_with("**Task state**")
-        || trimmed.starts_with("**Workspace / User Goal**")
-        || trimmed.starts_with("**Handoff Summary**")
-        || trimmed.starts_with("## Handoff Summary")
-        || trimmed.starts_with("**Checkpoint Summary**")
-        || trimmed.starts_with("**任务背景**")
-        || trimmed.starts_with("- User request:")
-        || trimmed.starts_with("- User asked:")
-        || (trimmed.starts_with("We are in ") && trimmed.contains("User asked"))
 }
 
 fn codex_countable_response_message_text(payload: &serde_json::Value) -> Option<String> {
@@ -2575,7 +2577,7 @@ mod tests {
                     "type": "message",
                     "id": "summary1",
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": "**Handoff Summary**\n- User request: x"}],
+                    "content": [{"type": "output_text", "text": "**Handoff Summary**\n- User request: x\n- Current parser state: compacted payload carries the generated summary text, so this response should be metadata."}],
                     "phase": "final_answer"
                 }
             }),
@@ -2583,7 +2585,7 @@ mod tests {
                 "timestamp": "2026-07-04T00:00:02.700Z",
                 "type": "compacted",
                 "payload": {
-                    "message": "**Handoff Summary**\n- User request: x"
+                    "message": "**Handoff Summary**\n- User request: x\n- Current parser state: compacted payload carries the generated summary text, so this response should be metadata."
                 }
             }),
             json!({
@@ -2724,13 +2726,20 @@ mod tests {
             && m.blocks
                 .iter()
                 .any(|b| b.text.as_deref() == Some("真实最终回答"))));
-        assert!(
-            !detail.messages.iter().any(|m| m.blocks.iter().any(|b| b
-                .text
-                .as_deref()
-                .is_some_and(|t| t.starts_with("**Handoff Summary**")))),
-            "compaction 生成的 handoff 摘要不应作为最终回答展示"
-        );
+        let handoff_summary = detail
+            .messages
+            .iter()
+            .find(|m| {
+                m.blocks.iter().any(|b| {
+                    b.text
+                        .as_deref()
+                        .is_some_and(|t| t.starts_with("**Handoff Summary**"))
+                })
+            })
+            .expect("compaction 生成的 handoff 摘要应作为 meta 保留");
+        assert!(handoff_summary.is_meta);
+        assert_eq!(handoff_summary.role, "assistant");
+        assert_eq!(handoff_summary.phase.as_deref(), Some("final_answer"));
         assert!(detail
             .messages
             .iter()
@@ -3014,7 +3023,10 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("meta.jsonl");
         let compacted_summary = "We are in `/tmp/proj`. User asked in Chinese: “再次进行深度review”. Need continue from current state.";
-        let checkpoint_summary = "**Checkpoint Summary**\n\n**Progress / Decisions**\n- done";
+        let checkpoint_summary = "**Checkpoint Summary**\n\n**Progress / Decisions**\n- Parsing now relies on the structural compacted payload coverage instead of a title whitelist.\n- Keep this long enough to be a substantial summary.";
+        let current_progress_summary =
+            "**Current Progress**\n- Main workspace: `/tmp/proj`.\n- User is analyzing parsing.";
+        let prefix_free_summary = "这段上下文压缩摘要故意不使用任何固定标题前缀。它记录了当前工作目录、用户正在验证 Codex compacted 结构事件，以及下一步需要继续运行解析测试来确认展示不会把摘要当作普通最终回答。";
         let jsonl = [
             json!({
                 "timestamp": "2026-07-04T00:00:00.000Z",
@@ -3081,6 +3093,50 @@ mod tests {
                 }
             }),
             json!({
+                "timestamp": "2026-07-04T00:00:02.400Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "summary3",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": current_progress_summary}],
+                    "phase": "final_answer",
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "compact-turn-without-user"
+                    }
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:02.500Z",
+                "type": "compacted",
+                "payload": {
+                    "message": format!("Another language model started to solve this problem.\n{current_progress_summary}")
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:02.600Z",
+                "type": "event_msg",
+                "payload": {"type": "context_compacted"}
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:02.700Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "summary4",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": prefix_free_summary}],
+                    "phase": "final_answer"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-04T00:00:02.800Z",
+                "type": "compacted",
+                "payload": {
+                    "message": format!("Compacted replacement payload:\n{prefix_free_summary}")
+                }
+            }),
+            json!({
                 "timestamp": "2026-07-04T00:00:03.000Z",
                 "type": "response_item",
                 "payload": {
@@ -3117,19 +3173,32 @@ mod tests {
                 && m.meta_kind.as_deref() == Some("skill")
                 && m.blocks.iter().any(|b| b.kind == "skill")
         }));
-        assert!(
-            !detail
+        for expected in [
+            "User asked in Chinese",
+            "**Checkpoint Summary**",
+            "**Current Progress**",
+            "故意不使用任何固定标题前缀",
+        ] {
+            let summary = detail
                 .messages
                 .iter()
-                .any(|m| message_text(m).contains("User asked in Chinese")),
-            "compaction summary should not be shown as a final answer"
-        );
+                .find(|m| message_text(m).contains(expected))
+                .expect("compaction summary should be retained as metadata");
+            assert!(summary.is_meta);
+            assert_eq!(summary.role, "assistant");
+            assert_eq!(summary.phase.as_deref(), Some("final_answer"));
+        }
         assert!(
-            !detail
-                .messages
-                .iter()
-                .any(|m| message_text(m).starts_with("**Checkpoint Summary**")),
-            "checkpoint summary should not be shown as a final answer"
+            !detail.messages.iter().any(|m| {
+                !m.is_meta
+                    && m.role == "assistant"
+                    && m.phase.as_deref() == Some("final_answer")
+                    && (message_text(m).contains("User asked in Chinese")
+                        || message_text(m).starts_with("**Checkpoint Summary**")
+                        || message_text(m).starts_with("**Current Progress**")
+                        || message_text(m).contains("故意不使用任何固定标题前缀"))
+            }),
+            "compaction summaries should not be shown as ordinary final answers"
         );
         assert!(detail.messages.iter().any(|m| {
             m.role == "assistant"
