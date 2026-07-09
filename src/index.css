@@ -106,6 +106,12 @@ body {
   overflow-wrap: anywhere;
 }
 
+.message-jump-highlight {
+  box-shadow:
+    0 0 0 2px var(--accent),
+    0 12px 28px -18px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+
 .markdown-message > :first-child {
   margin-top: 0;
 }

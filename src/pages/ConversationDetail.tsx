@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
   Check,
+  ChevronDown,
+  ChevronUp,
   Copy,
   Download,
   Folder,
@@ -62,6 +64,11 @@ type BlockToggles = {
 };
 
 type TFunction = ReturnType<typeof useT>;
+
+type UserPromptAnchor = {
+  index: number;
+  preview: string;
+};
 
 function blockEnabled(block: ContentBlock, toggles: BlockToggles): boolean {
   switch (block.kind) {
@@ -214,6 +221,61 @@ function messageCopyText(blocks: ContentBlock[], t: TFunction): string {
     .join("\n\n");
 }
 
+function truncatePromptPreview(text: string, maxLength = 120): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength - 1)}…`;
+}
+
+function scrollToElement(
+  id: string,
+  block: ScrollLogicalPosition = "center",
+  behavior: ScrollBehavior = "smooth"
+) {
+  document.getElementById(id)?.scrollIntoView({ block, behavior });
+}
+
+function flashMessageElement(id: string) {
+  const bubble = document
+    .getElementById(id)
+    ?.querySelector<HTMLElement>("[data-message-bubble]");
+  if (!bubble) return;
+
+  const previousTimer = bubble.dataset.jumpHighlightTimer;
+  if (previousTimer) window.clearTimeout(Number(previousTimer));
+
+  bubble.classList.add("message-jump-highlight");
+  const timer = window.setTimeout(() => {
+    bubble.classList.remove("message-jump-highlight");
+    delete bubble.dataset.jumpHighlightTimer;
+  }, 2500);
+  bubble.dataset.jumpHighlightTimer = String(timer);
+}
+
+function getConversationScrollContainer(): HTMLElement | Window {
+  const main = document.getElementById("conversation-top")?.closest("main");
+  return main instanceof HTMLElement ? main : window;
+}
+
+function scrollContainerCenter(container: HTMLElement | Window): number {
+  if (container instanceof Window) return window.innerHeight / 2;
+  const rect = container.getBoundingClientRect();
+  return rect.top + rect.height / 2;
+}
+
+function promptRailLineWidthClass(
+  railIndex: number,
+  hoveredRailIndex: number | null
+): string {
+  if (hoveredRailIndex == null) return "w-[11px]";
+
+  const distance = Math.abs(railIndex - hoveredRailIndex);
+  if (distance === 0) return "w-[27px]";
+  if (distance === 1) return "w-[21px]";
+  if (distance === 2) return "w-4";
+  return "w-[11px]";
+}
+
 function BlockView({
   block,
   renderMarkdown = false,
@@ -255,7 +317,7 @@ function BlockView({
   );
 }
 
-function MessageBubble({
+const MessageBubble = memo(function MessageBubble({
   msg,
   blocks,
   agentLabel,
@@ -285,6 +347,7 @@ function MessageBubble({
 
   return (
     <div
+      data-message-bubble
       className={cn(
         "rounded-xl border p-4 transition-shadow duration-150 motion-reduce:transition-none",
         isUser && !isMeta && "border-accent/30 bg-accent/[0.08]",
@@ -294,7 +357,7 @@ function MessageBubble({
           "border-dashed border-warning/30 bg-warning/[0.08]",
         isSkillMeta && "border-border bg-surface-2/80",
         isMeta && "border-dashed border-muted/40 bg-surface-2/70",
-        highlighted && "ring-2 ring-accent shadow-lg"
+        highlighted && "message-jump-highlight"
       )}
     >
       <div className="mb-2.5 flex items-start justify-between gap-2">
@@ -351,6 +414,143 @@ function MessageBubble({
         <p className="mt-2 text-[11px] text-muted">{t("commandReplyNote")}</p>
       )}
     </div>
+  );
+});
+
+function ConversationPromptRail({
+  prompts,
+  onJump,
+  onTop,
+  onBottom,
+}: {
+  prompts: UserPromptAnchor[];
+  onJump: (index: number) => void;
+  onTop: () => void;
+  onBottom: () => void;
+}) {
+  const t = useT();
+  const [activePromptIndex, setActivePromptIndex] = useState<number | null>(
+    prompts[0]?.index ?? null
+  );
+  const [hoveredRailIndex, setHoveredRailIndex] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (prompts.length === 0) return;
+
+    const scrollContainer = getConversationScrollContainer();
+    let frame = 0;
+
+    const updateActivePrompt = () => {
+      frame = 0;
+      const center = scrollContainerCenter(scrollContainer);
+      let nextIndex: number | null = null;
+      let nearestDistance = Number.POSITIVE_INFINITY;
+
+      for (const prompt of prompts) {
+        const element = document.getElementById(`msg-${prompt.index}`);
+        if (!element) continue;
+        const distance = Math.abs(element.getBoundingClientRect().top - center);
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nextIndex = prompt.index;
+        }
+      }
+
+      setActivePromptIndex((prev) => (prev === nextIndex ? prev : nextIndex));
+    };
+
+    const scheduleUpdate = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(updateActivePrompt);
+    };
+
+    scheduleUpdate();
+    scrollContainer.addEventListener("scroll", scheduleUpdate, { passive: true });
+    window.addEventListener("resize", scheduleUpdate);
+
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      scrollContainer.removeEventListener("scroll", scheduleUpdate);
+      window.removeEventListener("resize", scheduleUpdate);
+    };
+  }, [prompts]);
+
+  if (prompts.length === 0) return null;
+
+  return (
+    <nav
+      aria-label={t("conversationPromptRail")}
+      className="fixed right-5 top-1/2 z-20 hidden -translate-y-1/2 xl:block"
+    >
+      <div className="flex flex-col items-center px-1 py-1">
+        <button
+          type="button"
+          onClick={onTop}
+          title={t("jumpToTop")}
+          aria-label={t("jumpToTop")}
+          className="group relative mb-0.5 flex h-5 w-12 items-center justify-center rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+        >
+          <ChevronUp
+            size={24}
+            strokeWidth={2.25}
+            className="text-muted/55 transition-[color,transform] duration-150 ease-out group-hover:scale-120 group-hover:text-foreground/75 group-focus-visible:scale-120 group-focus-visible:text-foreground/75"
+          />
+        </button>
+
+        <div
+          className="flex max-h-[min(34rem,calc(100vh-11rem))] flex-col items-center gap-0 overflow-visible py-0.5"
+          onMouseLeave={() => setHoveredRailIndex(null)}
+        >
+          {prompts.map((prompt, railIndex) => (
+            <button
+              key={prompt.index}
+              type="button"
+              onMouseEnter={() => setHoveredRailIndex(railIndex)}
+              onFocus={() => setHoveredRailIndex(railIndex)}
+              onBlur={() => setHoveredRailIndex(null)}
+              onClick={() => {
+                setActivePromptIndex(prompt.index);
+                onJump(prompt.index);
+              }}
+              aria-label={t("jumpToPrompt", { index: prompt.index + 1 })}
+              className="group relative flex h-[9px] w-12 items-center justify-center rounded-full focus-visible:outline-none"
+            >
+              <span className="relative h-0.5 w-[11px]">
+                <span
+                  className={cn(
+                    "prompt-rail-line absolute right-0 top-0 h-0.5 rounded-full transition-[width,background-color] duration-150 ease-out",
+                    promptRailLineWidthClass(railIndex, hoveredRailIndex),
+                    hoveredRailIndex === railIndex ||
+                      activePromptIndex === prompt.index
+                      ? "bg-foreground/70"
+                      : "bg-muted/30"
+                  )}
+                />
+              </span>
+              <span className="pointer-events-none absolute right-full top-1/2 mr-3 hidden w-72 -translate-y-1/2 rounded-lg border border-border/80 bg-surface/95 px-3 py-2 text-left text-[11px] leading-relaxed text-foreground shadow-2xl shadow-black/10 backdrop-blur-md group-hover:block group-focus-visible:block dark:shadow-black/40">
+                <span className="promptRailPreview line-clamp-4">
+                  {prompt.preview || t("emptyPromptPreview")}
+                </span>
+              </span>
+            </button>
+          ))}
+        </div>
+
+        <button
+          type="button"
+          onClick={onBottom}
+          title={t("jumpToBottom")}
+          aria-label={t("jumpToBottom")}
+          className="group relative mt-0.5 flex h-5 w-12 items-center justify-center rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+        >
+          <ChevronDown
+            size={24}
+            strokeWidth={2.25}
+            className="text-muted/55 transition-[color,transform] duration-150 ease-out group-hover:scale-120 group-hover:text-foreground/75 group-focus-visible:scale-120 group-focus-visible:text-foreground/75"
+          />
+        </button>
+      </div>
+    </nav>
   );
 }
 
@@ -491,6 +691,15 @@ export function ConversationDetail() {
       );
   }, [data, effectiveViewOptions]);
 
+  const userPromptAnchors = useMemo<UserPromptAnchor[]>(() => {
+    return visibleMessages
+      .filter(({ msg }) => msg.role === "user" && !msg.isMeta)
+      .map(({ index, blocks }) => ({
+        index,
+        preview: truncatePromptPreview(messageCopyText(blocks, t)),
+      }));
+  }, [t, visibleMessages]);
+
   const exportableVisibleKeys = useMemo(() => {
     if (!data) return [];
     return visibleMessages
@@ -549,6 +758,20 @@ export function ConversationDetail() {
 
   const handleToggleSelectAll = (checked: boolean) => {
     setSelectedMessageKeys(checked ? exportableVisibleKeys : []);
+  };
+
+  const scrollToConversationTop = () => {
+    scrollToElement("conversation-top", "start", "auto");
+  };
+
+  const scrollToConversationBottom = () => {
+    scrollToElement("conversation-bottom", "end", "auto");
+  };
+
+  const scrollToPrompt = (index: number) => {
+    const targetId = `msg-${index}`;
+    flashMessageElement(targetId);
+    scrollToElement(targetId, "center", "auto");
   };
 
   const selectedMessageIndexes = () => {
@@ -636,7 +859,7 @@ export function ConversationDetail() {
     : "";
 
   return (
-    <div className="mx-auto max-w-4xl px-6 py-6">
+    <div id="conversation-top" className="mx-auto max-w-4xl px-6 py-6">
       <Button
         variant="ghost"
         size="sm"
@@ -663,6 +886,13 @@ export function ConversationDetail() {
         />
       ) : data ? (
         <>
+          <ConversationPromptRail
+            prompts={userPromptAnchors}
+            onJump={scrollToPrompt}
+            onTop={scrollToConversationTop}
+            onBottom={scrollToConversationBottom}
+          />
+
           <div className="mb-5">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h1 className="text-lg font-semibold text-foreground">
@@ -1062,6 +1292,7 @@ export function ConversationDetail() {
               })}
             </div>
           )}
+          <div id="conversation-bottom" className="h-px" />
         </>
       ) : null}
     </div>
