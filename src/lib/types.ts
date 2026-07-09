@@ -217,6 +217,7 @@ export interface ExportResult {
 /* ----------------------------- 对话导出 ----------------------------- */
 
 export interface ConversationExportResult {
+  markdown: string;
   preview: string;
   path: string | null;
   messageCount: number;

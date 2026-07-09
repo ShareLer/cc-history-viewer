@@ -268,11 +268,35 @@ pub struct ExportResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationExportResult {
+    /// 完整 Markdown 内容，供前端复制到剪贴板。
+    pub markdown: String,
     /// Markdown 预览（前 12000 字符，超出截断）
     pub preview: String,
     /// 实际写入的文件绝对路径；仅 write=true 时有值
     pub path: Option<String>,
     pub message_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConversationExportResult;
+
+    #[test]
+    fn conversation_export_result_serializes_full_markdown() {
+        let result = ConversationExportResult {
+            markdown: "# 对话导出\n\n完整内容".to_string(),
+            preview: "# 对话导出".to_string(),
+            path: None,
+            message_count: 2,
+        };
+
+        let json = serde_json::to_value(result).unwrap();
+
+        assert_eq!(json["markdown"], "# 对话导出\n\n完整内容");
+        assert_eq!(json["preview"], "# 对话导出");
+        assert_eq!(json["path"], serde_json::Value::Null);
+        assert_eq!(json["messageCount"], 2);
+    }
 }
 
 // ----------------------------- 设置 -----------------------------

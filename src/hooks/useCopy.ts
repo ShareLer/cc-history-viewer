@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 /**
  * 复制到剪贴板 + 短暂「已复制」反馈。
  * copy(text) 成功后 copied 变为 true，约 resetDelay 毫秒后自动复原，
+ * 并返回 true；失败时返回 false。
  * 供按钮把 Copy 图标短暂切换为 Check。
  */
 export function useCopy(resetDelay = 1500) {
@@ -25,8 +26,9 @@ export function useCopy(resetDelay = 1500) {
           () => setCopied(false),
           resetDelay
         );
+        return true;
       } catch {
-        // 剪贴板不可用时静默忽略
+        return false;
       }
     },
     [resetDelay]

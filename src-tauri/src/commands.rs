@@ -487,6 +487,7 @@ pub fn export_conversation(
 
     Ok(ConversationExportResult {
         preview: export::truncate_preview(&markdown, lang),
+        markdown,
         path,
         message_count: exported_count,
     })

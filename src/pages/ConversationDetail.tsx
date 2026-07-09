@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
 import {
   ArrowLeft,
   Check,
+  Copy,
   Download,
   Folder,
   FolderOpen,
@@ -18,7 +19,6 @@ import {
   Button,
   CenterMessage,
   Skeleton,
-  Spinner,
 } from "@/components/ui";
 import { MarkdownMessage } from "@/components/MarkdownMessage";
 import type {
@@ -60,6 +60,8 @@ type BlockToggles = {
   tools: boolean;
   skills: boolean;
 };
+
+type TFunction = ReturnType<typeof useT>;
 
 function blockEnabled(block: ContentBlock, toggles: BlockToggles): boolean {
   switch (block.kind) {
@@ -179,6 +181,39 @@ function revealOptionsForMessage(
   };
 }
 
+function blockSummary(block: ContentBlock, t: TFunction): string {
+  return block.kind === "tool_use"
+    ? t("toolUseLabel", { name: block.toolName ?? "tool" })
+    : block.kind === "thinking"
+      ? t("thinkingLabel")
+      : block.kind === "tool_result"
+        ? t("toolResultLabel")
+        : block.kind === "skill"
+          ? t("skillDetailLabel")
+          : block.kind;
+}
+
+function blockBody(block: ContentBlock): string {
+  return block.kind === "tool_use"
+    ? JSON.stringify(block.toolInput ?? {}, null, 2)
+    : block.text ?? "";
+}
+
+function blockCopyText(block: ContentBlock, t: TFunction): string {
+  if (block.kind === "text") return block.text ?? "";
+  if (block.kind === "image") return block.text ?? t("imageFallback");
+  const summary = blockSummary(block, t);
+  const body = blockBody(block);
+  return body ? `${summary}\n${body}` : summary;
+}
+
+function messageCopyText(blocks: ContentBlock[], t: TFunction): string {
+  return blocks
+    .map((block) => blockCopyText(block, t).trim())
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 function BlockView({
   block,
   renderMarkdown = false,
@@ -205,20 +240,8 @@ function BlockView({
     );
   }
 
-  const summary =
-    block.kind === "tool_use"
-      ? t("toolUseLabel", { name: block.toolName ?? "tool" })
-      : block.kind === "thinking"
-        ? t("thinkingLabel")
-        : block.kind === "tool_result"
-          ? t("toolResultLabel")
-          : block.kind === "skill"
-            ? t("skillDetailLabel")
-            : block.kind;
-  const body =
-    block.kind === "tool_use"
-      ? JSON.stringify(block.toolInput ?? {}, null, 2)
-      : block.text ?? "";
+  const summary = blockSummary(block, t);
+  const body = blockBody(block);
 
   return (
     <details className="rounded-lg border border-border bg-background/70">
@@ -244,6 +267,7 @@ function MessageBubble({
   highlighted?: boolean;
 }) {
   const t = useT();
+  const { copied: messageCopied, copy: copyMessage } = useCopy();
   const isUser = msg.role === "user";
   const isSystem = msg.role === "system";
   const isMeta = msg.isMeta;
@@ -273,30 +297,46 @@ function MessageBubble({
         highlighted && "ring-2 ring-accent shadow-lg"
       )}
     >
-      <div className="mb-2.5 flex items-center gap-2">
-        <Badge
-          tone={
-            isMeta
-              ? "outline"
-              : isUser
-                ? "accent"
-                : isSkillMeta
-                  ? "muted"
-                  : isSystem
-                    ? "warning"
-                    : "default"
-          }
+      <div className="mb-2.5 flex items-start justify-between gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <Badge
+            tone={
+              isMeta
+                ? "outline"
+                : isUser
+                  ? "accent"
+                  : isSkillMeta
+                    ? "muted"
+                    : isSystem
+                      ? "warning"
+                      : "default"
+            }
+          >
+            {roleLabel}
+          </Badge>
+          {msg.isSidechain && <Badge tone="muted">{t("sidechainBadge")}</Badge>}
+          {msg.phase === "commentary" && (
+            <Badge tone="outline">{t("codexCommentaryBadge")}</Badge>
+          )}
+          {msg.phase === "final_answer" && (
+            <Badge tone="muted">{t("codexFinalAnswerBadge")}</Badge>
+          )}
+          <span className="text-[11px] text-muted">{absoluteTime(msg.timestamp)}</span>
+        </div>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          onClick={() => copyMessage(messageCopyText(blocks, t))}
+          title={t("copyMessage")}
+          aria-label={t("copyMessage")}
+          className={cn(
+            "-mr-2 -mt-2 shrink-0 text-muted hover:text-accent",
+            messageCopied && "text-success hover:text-success"
+          )}
         >
-          {roleLabel}
-        </Badge>
-        {msg.isSidechain && <Badge tone="muted">{t("sidechainBadge")}</Badge>}
-        {msg.phase === "commentary" && (
-          <Badge tone="outline">{t("codexCommentaryBadge")}</Badge>
-        )}
-        {msg.phase === "final_answer" && (
-          <Badge tone="muted">{t("codexFinalAnswerBadge")}</Badge>
-        )}
-        <span className="text-[11px] text-muted">{absoluteTime(msg.timestamp)}</span>
+          {messageCopied ? <Check size={13} /> : <Copy size={13} />}
+        </Button>
       </div>
       <div className="space-y-2">
         {blocks.map((b, i) => (
@@ -322,6 +362,7 @@ export function ConversationDetail() {
     sessionId ?? null
   );
   const { copied, copy } = useCopy();
+  const { copy: copyMarkdown } = useCopy();
 
   const [searchParams] = useSearchParams();
   const targetUuid = searchParams.get("m");
@@ -351,10 +392,16 @@ export function ConversationDetail() {
   const selectAllRef = useRef<HTMLInputElement>(null);
   const previousExportableVisibleKeysRef = useRef<string[]>([]);
   const jumpedTargetRef = useRef<string | null>(null);
-  const [exporting, setExporting] = useState(false);
+  const [exportAction, setExportAction] = useState<"file" | "clipboard" | null>(
+    null
+  );
+  const exportBusy = exportAction !== null;
   const [exportResult, setExportResult] =
     useState<ConversationExportResult | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [lastExportTarget, setLastExportTarget] = useState<
+    "file" | "clipboard" | null
+  >(null);
 
   const effectiveViewOptions = useMemo<ViewOptions>(() => {
     if (!exportOpen) return viewOptions;
@@ -488,6 +535,7 @@ export function ConversationDetail() {
     setExportOpen(next);
     setExportError(null);
     setExportResult(null);
+    setLastExportTarget(null);
     if (next) {
       setSelectedMessageKeys(exportableVisibleKeys);
     }
@@ -503,37 +551,66 @@ export function ConversationDetail() {
     setSelectedMessageKeys(checked ? exportableVisibleKeys : []);
   };
 
-  const handleExport = async () => {
-    if (!data || exporting || selectedMessageKeys.length === 0) return;
-    const messageIndexes = selectedMessageKeys
+  const selectedMessageIndexes = () => {
+    if (!data) return [];
+    return selectedMessageKeys
       .map((key) => Number(key))
       .filter(
         (index) =>
           Number.isInteger(index) && index >= 0 && index < data.messages.length
       );
+  };
+
+  const exportConversation = async (write: boolean) => {
+    if (!data) return null;
+    const messageIndexes = selectedMessageIndexes();
     if (messageIndexes.length === 0) return;
-    setExporting(true);
+    return api.exportConversation({
+      sessionId: data.sessionId,
+      write,
+      lang: getCurrentLang(),
+      includeThinking: exportOptions.includeThinking,
+      includeTools: exportOptions.includeTools,
+      includeSkills: exportOptions.includeSkills,
+      includeMeta: exportOptions.includeMeta,
+      includeCodexCommentary: exportOptions.includeCodexCommentary,
+      includeSubagent: exportOptions.includeSubagent,
+      includeTime: exportOptions.includeTime,
+      messageIndexes,
+    });
+  };
+
+  const handleExportToFile = async () => {
+    if (!data || exportBusy || selectedMessageKeys.length === 0) return;
+    setExportAction("file");
     setExportError(null);
-    setExportResult(null);
     try {
-      const res = await api.exportConversation({
-        sessionId: data.sessionId,
-        write: true,
-        lang: getCurrentLang(),
-        includeThinking: exportOptions.includeThinking,
-        includeTools: exportOptions.includeTools,
-        includeSkills: exportOptions.includeSkills,
-        includeMeta: exportOptions.includeMeta,
-        includeCodexCommentary: exportOptions.includeCodexCommentary,
-        includeSubagent: exportOptions.includeSubagent,
-        includeTime: exportOptions.includeTime,
-        messageIndexes,
-      });
+      const res = await exportConversation(true);
+      if (!res) return;
       setExportResult(res);
+      setLastExportTarget("file");
     } catch (e) {
       setExportError(errMessage(e));
     } finally {
-      setExporting(false);
+      setExportAction(null);
+    }
+  };
+
+  const handleCopyMarkdown = async () => {
+    if (!data || exportBusy || selectedMessageKeys.length === 0) return;
+    setExportAction("clipboard");
+    setExportError(null);
+    try {
+      const res = await exportConversation(false);
+      if (!res) return;
+      const ok = await copyMarkdown(res.markdown);
+      if (!ok) throw new Error(t("copyMarkdownFailed"));
+      setExportResult(res);
+      setLastExportTarget("clipboard");
+    } catch (e) {
+      setExportError(errMessage(e));
+    } finally {
+      setExportAction(null);
     }
   };
 
@@ -835,15 +912,24 @@ export function ConversationDetail() {
                   </span>
                   <Button
                     size="sm"
-                    onClick={handleExport}
-                    disabled={exporting || selectedExportableCount === 0}
+                    onClick={handleExportToFile}
+                    disabled={selectedExportableCount === 0}
+                    aria-disabled={exportBusy}
+                    aria-busy={exportAction === "file"}
                   >
-                    {exporting ? (
-                      <Spinner className="border-accent-fg/40 border-t-accent-fg" />
-                    ) : (
-                      <Download size={13} />
-                    )}
-                    {exporting ? t("exporting") : t("confirmExport")}
+                    <Download size={13} />
+                    {t("exportToFile")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleCopyMarkdown}
+                    disabled={selectedExportableCount === 0}
+                    aria-disabled={exportBusy}
+                    aria-busy={exportAction === "clipboard"}
+                  >
+                    <Copy size={13} />
+                    {t("copyMarkdownToClipboard")}
                   </Button>
                 </div>
                 <div className="border-t border-border px-3 py-2 text-xs text-muted">
@@ -860,19 +946,27 @@ export function ConversationDetail() {
             {exportResult && (
               <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
                 <Check size={13} className="shrink-0 text-success" />
-                <span className="text-foreground">
-                  {t("exportedMessages", {
-                    count: formatNumber(exportResult.messageCount),
-                  })}{" "}
-                  <span
-                    className="font-medium"
-                    title={exportResult.path ?? undefined}
-                  >
-                    {exportResult.path
-                      ? pathBaseName(exportResult.path)
-                      : t("notWrittenToFile")}
+                {lastExportTarget === "clipboard" ? (
+                  <span className="text-foreground">
+                    {t("copiedMarkdownMessages", {
+                      count: formatNumber(exportResult.messageCount),
+                    })}
                   </span>
-                </span>
+                ) : (
+                  <span className="text-foreground">
+                    {t("exportedMessages", {
+                      count: formatNumber(exportResult.messageCount),
+                    })}{" "}
+                    <span
+                      className="font-medium"
+                      title={exportResult.path ?? undefined}
+                    >
+                      {exportResult.path
+                        ? pathBaseName(exportResult.path)
+                        : t("notWrittenToFile")}
+                    </span>
+                  </span>
+                )}
                 {exportResult.path && (
                   <button
                     onClick={revealExported}
